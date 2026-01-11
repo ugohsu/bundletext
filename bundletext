@@ -20,8 +20,10 @@ Features
 - Tree:
   - Default behavior: Project Tree includes ONLY files actually bundled ("tree-only-included" default)
 - Dry-run:
-  - --dry-run prints a report showing which files would be included vs skipped (with reasons),
-    and prints a tree annotated by status.
+  - --dry-run prints a report showing which files would be included vs skipped (with reasons).
+    It also prints:
+      * Candidate Tree: after excludes/.gitignore (before binary/size/readability checks)
+      * Project Tree  : included-only (same as real output)
 
 Output format
 - The bundle contains:
@@ -122,12 +124,9 @@ Guidelines:
 # Data models
 # -----------------------------------------------------------------------------
 class SkipReason(str, Enum):
-    EXCLUDED = "excluded"
-    GITIGNORE = "gitignore"
     BINARY = "binary"
     TOO_BIG = "too_big"
     UNREADABLE = "unreadable"
-    OUTSIDE_ROOT = "outside_root"  # currently used only for gitignore applicability (informational)
 
 
 @dataclass(frozen=True)
@@ -142,7 +141,7 @@ class Config:
     exclude_globs: Tuple[str, ...]
     exclude_paths: Tuple[str, ...]  # explicit paths (relative or absolute)
 
-    tree_max_depth: int  # 0 = unlimited
+    tree_max_depth: int  # 0 = unlimited (also applies to traversal; kept for backward-compat)
     include_tree: bool
 
     max_bytes: int  # 0 = unlimited
@@ -158,9 +157,9 @@ class Config:
 
 @dataclass
 class FileDecision:
-    path: str  # representative path (may be symlink path)
-    abs_path: str
-    uniq_key: str  # realpath if follow_symlinks else abspath
+    path: str          # representative path (might be a symlink path)
+    abs_path: str      # abspath of representative path
+    uniq_key: str      # realpath if follow_symlinks else abspath
 
     included: bool
     reason: Optional[SkipReason] = None
@@ -168,6 +167,14 @@ class FileDecision:
 
     read_bytes: Optional[int] = None  # None=full text read, else read first N bytes then decode
     truncated: bool = False
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """After excludes/.gitignore, before binary/size/readability checks."""
+    rep_path: str
+    abs_path: str
+    uniq_key: str
 
 
 # -----------------------------------------------------------------------------
@@ -263,9 +270,9 @@ def matches_any_glob(path: str, globs: Sequence[str]) -> bool:
     return False
 
 
-def resolve_exclude_paths(cfg: Config) -> Set[str]:
+def resolve_exclude_paths(exclude_paths: Sequence[str]) -> Set[str]:
     out: Set[str] = set()
-    for raw in cfg.exclude_paths:
+    for raw in exclude_paths:
         if not raw:
             continue
         abs_p = os.path.abspath(raw)
@@ -276,28 +283,30 @@ def resolve_exclude_paths(cfg: Config) -> Set[str]:
 # -----------------------------------------------------------------------------
 # Binary detection (UTF-8-first)
 # -----------------------------------------------------------------------------
-def is_probably_text_file(path: str, sample_size: int = 4096) -> bool:
+def probe_textiness(path: str, sample_size: int = 4096) -> Tuple[bool, Optional[str]]:
     """
     UTF-8-first heuristic (robust for Japanese text):
 
     - If NUL byte exists -> binary
     - If sample decodes as UTF-8 -> treat as text
     - Else fallback to "control-character ratio" heuristic
+
+    Returns:
+      (is_text, detail_if_binary_or_uncertain)
+    Raises:
+      OSError/IOError if the file can't be read at all (caller should classify as UNREADABLE).
     """
-    try:
-        with open(path, "rb") as f:
-            sample = f.read(sample_size)
-    except Exception:
-        return False
+    with open(path, "rb") as f:
+        sample = f.read(sample_size)
 
     if b"\x00" in sample:
-        return False
+        return False, "contains NUL byte(s)"
     if not sample:
-        return True
+        return True, None
 
     try:
         sample.decode("utf-8")
-        return True
+        return True, None
     except UnicodeDecodeError:
         pass
 
@@ -306,7 +315,10 @@ def is_probably_text_file(path: str, sample_size: int = 4096) -> bool:
         # allow tab(9), lf(10), cr(13)
         if b < 9 or (13 < b < 32):
             ctrl += 1
-    return (ctrl / len(sample)) < 0.02
+    ratio = (ctrl / len(sample))
+    if ratio < 0.02:
+        return True, None
+    return False, f"control-char ratio={ratio:.3f} (>=0.02)"
 
 
 # -----------------------------------------------------------------------------
@@ -421,6 +433,7 @@ def iter_candidate_files_under_root(
     Yield candidate file paths after applying:
       - exclude-dir/file/glob/path/path-substr
       - gitignore (if enabled)
+
     Binary/size/unreadable checks are NOT done here.
 
     Symlinks:
@@ -538,17 +551,18 @@ def decide_read_bytes_for_file(path: str, cfg: Config) -> Tuple[Optional[int], b
     return None, False, False
 
 
-def plan_files(cfg: Config) -> Tuple[List[FileDecision], Dict[str, Dict[str, List[str]]]]:
+def collect_candidates(cfg: Config) -> Tuple[List[Candidate], Dict[str, Dict[str, List[str]]]]:
     """
+    Collect candidates after excludes/.gitignore. Also performs global de-dup by uniq_key_for.
+
     Returns:
-      decisions: one per unique target (uniq_key)
-      gitignore_caches: per directory root cache (for potential reuse)
+      candidates: sorted by representative path (stable)
+      gitignore_caches: per directory root cache
     """
     exclude_dir_names = set(cfg.exclude_dir_names)
     exclude_file_names = set(cfg.exclude_file_names)
-    exclude_paths_abs = resolve_exclude_paths(cfg)
+    exclude_paths_abs = resolve_exclude_paths(cfg.exclude_paths)
 
-    # gitignore caches per directory root
     gitignore_caches: Dict[str, Dict[str, List[str]]] = {}
     if cfg.use_gitignore:
         for r in cfg.roots:
@@ -556,9 +570,7 @@ def plan_files(cfg: Config) -> Tuple[List[FileDecision], Dict[str, Dict[str, Lis
             if os.path.isdir(r_abs):
                 gitignore_caches[r_abs] = build_gitignore_cache(r_abs)
 
-    # Collect candidates (dedup by uniq_key_for across all roots)
-    uniq_to_rep: Dict[str, str] = {}
-    rep_to_root_abs: Dict[str, Optional[str]] = {}
+    uniq_to_candidate: Dict[str, Candidate] = {}
 
     for r in cfg.roots:
         r_abs = os.path.abspath(r)
@@ -572,21 +584,51 @@ def plan_files(cfg: Config) -> Tuple[List[FileDecision], Dict[str, Dict[str, Lis
             gi_cache,
         ):
             key = uniq_key_for(fp, cfg.follow_symlinks)
-            if key not in uniq_to_rep:
-                uniq_to_rep[key] = fp
-                rep_to_root_abs[fp] = r_abs if os.path.isdir(r_abs) else None
+            if key in uniq_to_candidate:
+                continue
+            uniq_to_candidate[key] = Candidate(
+                rep_path=fp,
+                abs_path=os.path.abspath(fp),
+                uniq_key=key,
+            )
 
-    reps = sorted(uniq_to_rep.values())
+    candidates = sorted(uniq_to_candidate.values(), key=lambda c: c.rep_path)
+    return candidates, gitignore_caches
+
+
+def plan_files(cfg: Config) -> Tuple[List[FileDecision], List[str]]:
+    """
+    Returns:
+      decisions: decisions for each candidate (one per unique target)
+      candidate_abs: absolute paths for candidate tree (after excludes/.gitignore)
+    """
+    candidates, _gi = collect_candidates(cfg)
+    candidate_abs = [c.abs_path for c in candidates]
 
     decisions: List[FileDecision] = []
-    for rep in reps:
-        abs_p = os.path.abspath(rep)
-        key = uniq_key_for(rep, cfg.follow_symlinks)
+    for c in candidates:
+        rep = c.rep_path
+        abs_p = c.abs_path
+        key = c.uniq_key
 
-        # binary check
+        # 1) binary check (optional)
         if not cfg.no_binary_check:
-            ok = is_probably_text_file(rep)
-            if not ok:
+            try:
+                is_text, detail = probe_textiness(rep)
+            except Exception as e:
+                decisions.append(
+                    FileDecision(
+                        path=rep,
+                        abs_path=abs_p,
+                        uniq_key=key,
+                        included=False,
+                        reason=SkipReason.UNREADABLE,
+                        detail=str(e),
+                    )
+                )
+                continue
+
+            if not is_text:
                 decisions.append(
                     FileDecision(
                         path=rep,
@@ -594,11 +636,12 @@ def plan_files(cfg: Config) -> Tuple[List[FileDecision], Dict[str, Dict[str, Lis
                         uniq_key=key,
                         included=False,
                         reason=SkipReason.BINARY,
+                        detail=detail,
                     )
                 )
                 continue
 
-        # size policy
+        # 2) size policy
         read_bytes, will_skip, will_truncate = decide_read_bytes_for_file(rep, cfg)
         if will_skip:
             decisions.append(
@@ -613,7 +656,7 @@ def plan_files(cfg: Config) -> Tuple[List[FileDecision], Dict[str, Dict[str, Lis
             )
             continue
 
-        # try-open check (cheap, catches permission / encoding issues early)
+        # 3) try-open check (permission / transient issues)
         try:
             if read_bytes is None:
                 with open(rep, "r", encoding="utf-8", errors="replace") as f:
@@ -645,7 +688,7 @@ def plan_files(cfg: Config) -> Tuple[List[FileDecision], Dict[str, Dict[str, Lis
             )
         )
 
-    return decisions, gitignore_caches
+    return decisions, candidate_abs
 
 
 # -----------------------------------------------------------------------------
@@ -677,13 +720,12 @@ def _render_tree(node: dict, depth: int, max_depth: int) -> List[str]:
     return lines
 
 
-
 def build_tree_from_files(roots: Sequence[str], files_abs: Sequence[str], max_depth: int, title: str) -> str:
     """
     Build a simple tree from given absolute file paths under provided roots.
-    (Used for dry-run candidate tree and for included-only tree.)
     """
     lines = [title]
+    files_set = set(files_abs)  # perf
 
     for root in roots:
         root_norm = os.path.normpath(root)
@@ -692,7 +734,7 @@ def build_tree_from_files(roots: Sequence[str], files_abs: Sequence[str], max_de
 
         if os.path.isfile(root_norm):
             abs_root = os.path.abspath(root_norm)
-            if abs_root in files_abs:
+            if abs_root in files_set:
                 lines.append(os.path.basename(root_norm))
             continue
 
@@ -713,152 +755,18 @@ def build_tree_from_files(roots: Sequence[str], files_abs: Sequence[str], max_de
         for rel in rel_paths:
             rel = os.path.normpath(rel)
             parts = [pp for pp in rel.split(os.sep) if pp and pp != "."]
-            if not parts:
-                continue
-            _insert_path(tree, parts)
+            if parts:
+                _insert_path(tree, parts)
 
         rendered = _render_tree(tree, depth=1, max_depth=max_depth if max_depth > 0 else 0)
         lines.extend(rendered)
 
     lines.append("====================\n")
     return "\n".join(lines)
+
 
 def build_tree_from_included_files(roots: Sequence[str], included_abs: Sequence[str], max_depth: int) -> str:
-    lines = ["=== Project Tree ==="]
-
-    for root in roots:
-        root_norm = os.path.normpath(root)
-        if not os.path.exists(root_norm):
-            continue
-
-        if os.path.isfile(root_norm):
-            abs_root = os.path.abspath(root_norm)
-            if abs_root in included_abs:
-                lines.append(os.path.basename(root_norm))
-            continue
-
-        root_abs = os.path.abspath(root_norm)
-        lines.append(f"{os.path.basename(root_norm) or root_norm}/")
-
-        rel_paths: List[str] = []
-        for fp_abs in included_abs:
-            try:
-                rel = os.path.relpath(fp_abs, root_abs)
-            except Exception:
-                continue
-            if rel.startswith(".."):
-                continue
-            rel_paths.append(rel)
-
-        tree: dict = {}
-        for rel in rel_paths:
-            rel = os.path.normpath(rel)
-            parts = [p for p in rel.split(os.sep) if p and p != "."]
-            if not parts:
-                continue
-            _insert_path(tree, parts)
-
-        rendered = _render_tree(tree, depth=1, max_depth=max_depth if max_depth > 0 else 0)
-        lines.extend(rendered)
-
-    lines.append("====================\n")
-    return "\n".join(lines)
-
-
-def build_tree_annotated(
-    roots: Sequence[str],
-    decisions: Sequence[FileDecision],
-    max_depth: int,
-) -> str:
-    """
-    Dry-run tree: show candidates (after excludes/gitignore), annotated by decision.
-    Status markers:
-      - [OK] included
-      - [SKIP:reason] skipped
-    """
-    lines = ["=== Dry Run Tree (Annotated) ==="]
-
-    # map abs_path -> decision
-    dmap: Dict[str, FileDecision] = {d.abs_path: d for d in decisions}
-    included_abs = [d.abs_path for d in decisions if d.included]
-    # For building tree, we include *all* decisions, but annotate leaf nodes.
-    all_abs = [d.abs_path for d in decisions]
-
-    for root in roots:
-        root_norm = os.path.normpath(root)
-        if not os.path.exists(root_norm):
-            continue
-
-        if os.path.isfile(root_norm):
-            abs_root = os.path.abspath(root_norm)
-            d = dmap.get(abs_root)
-            if d:
-                if d.included:
-                    lines.append(f"[OK] {os.path.basename(root_norm)}")
-                else:
-                    lines.append(f"[SKIP:{d.reason}] {os.path.basename(root_norm)}")
-            continue
-
-        root_abs = os.path.abspath(root_norm)
-        lines.append(f"{os.path.basename(root_norm) or root_norm}/")
-
-        rel_paths: List[str] = []
-        for fp_abs in all_abs:
-            try:
-                rel = os.path.relpath(fp_abs, root_abs)
-            except Exception:
-                continue
-            if rel.startswith(".."):
-                continue
-            rel_paths.append(rel)
-
-        tree: dict = {}
-        for rel in rel_paths:
-            rel = os.path.normpath(rel)
-            parts = [p for p in rel.split(os.sep) if p and p != "."]
-            if not parts:
-                continue
-            _insert_path(tree, parts)
-
-        # custom render that annotates leaf files
-        def render(node: dict, depth: int) -> List[str]:
-            out: List[str] = []
-            if max_depth > 0 and depth > max_depth:
-                return out
-            indent = "    " * depth
-            dirs = sorted(node.get("dirs", {}).keys())
-            files = sorted(node.get("files", set()))
-            for dname in dirs:
-                if max_depth > 0 and depth >= max_depth:
-                    continue
-                out.append(f"{indent}{dname}/")
-                out.extend(render(node["dirs"][dname], depth + 1))
-            for fname in files:
-                # reconstruct abs to lookup: we can't easily here, so we'll annotate using included set by rel match
-                out.append(f"{indent}{fname}")
-            return out
-
-        rendered = render(tree, depth=1)
-
-        # annotate file lines by re-evaluating against decisions using rel paths
-        annotated: List[str] = []
-        for line in rendered:
-            stripped = line.strip()
-            if stripped.endswith("/"):
-                annotated.append(line)
-                continue
-            # It's a file; compute abs by joining root_abs with indentation-derived path:
-            # We'll reconstruct using the already built tree by walking path segments from indentation.
-            # Simpler: rebuild from rel_paths map:
-            # We'll just annotate if any decision endswith that basename at the same depth is ambiguous.
-            # To avoid ambiguity, we annotate only with basename when ambiguous: show "?".
-            annotated.append(line)
-        # A robust annotated tree is nice but costs complexity; instead, we provide explicit lists below.
-        lines.extend(rendered)
-
-    lines.append("==============================\n")
-    # NOTE: Tree lines above are structural; the authoritative included/excluded lists follow.
-    return "\n".join(lines)
+    return build_tree_from_files(roots, included_abs, max_depth, "=== Project Tree ===")
 
 
 # -----------------------------------------------------------------------------
@@ -927,7 +835,7 @@ def write_bundle(cfg: Config, decisions: Sequence[FileDecision]) -> int:
 
                 count += 1
             except Exception:
-                # unreadable at write time -> skip silently (plan already tried, but TOCTOU can happen)
+                # TOCTOU can happen; skip silently here.
                 continue
     finally:
         if close_after:
@@ -935,9 +843,13 @@ def write_bundle(cfg: Config, decisions: Sequence[FileDecision]) -> int:
 
     skipped_binary = sum(1 for d in decisions if (not d.included and d.reason == SkipReason.BINARY))
     skipped_big = sum(1 for d in decisions if (not d.included and d.reason == SkipReason.TOO_BIG))
+    skipped_unreadable = sum(1 for d in decisions if (not d.included and d.reason == SkipReason.UNREADABLE))
 
     print(
-        f"bundletext: wrote {count} file(s), skipped_binary={skipped_binary}, skipped_big={skipped_big}, truncated={truncated}",
+        "bundletext: "
+        f"wrote {count} file(s), "
+        f"skipped_binary={skipped_binary}, skipped_big={skipped_big}, skipped_unreadable={skipped_unreadable}, "
+        f"truncated={truncated}",
         file=sys.stderr,
     )
     if out_path != "-":
@@ -949,47 +861,50 @@ def write_bundle(cfg: Config, decisions: Sequence[FileDecision]) -> int:
 # -----------------------------------------------------------------------------
 # Dry-run report
 # -----------------------------------------------------------------------------
-def print_dry_run_report(cfg: Config, decisions: Sequence[FileDecision]) -> None:
+def print_dry_run_report(cfg: Config, decisions: Sequence[FileDecision], candidate_abs: Sequence[str]) -> None:
     included = [d for d in decisions if d.included]
     skipped = [d for d in decisions if not d.included]
 
-    # Trees
-    # - Candidate Tree: after excludes/.gitignore, before binary/size/unreadable decisions.
-    # - Project Tree   : identical to real output (included-only; default tree-only-included).
-    all_abs = [d.abs_path for d in decisions]
+    included_abs = [d.abs_path for d in included]
+
     if cfg.include_tree:
-        cand_tree = build_tree_from_files(cfg.roots, all_abs, cfg.tree_max_depth, "=== Candidate Tree ===")
+        # Candidate Tree = after excludes/.gitignore (before binary/size/readability)
+        cand_tree = build_tree_from_files(cfg.roots, candidate_abs, cfg.tree_max_depth, "=== Candidate Tree ===")
         print(cand_tree)
+
+        # Project Tree = included-only (same as real output)
         tree = build_tree_from_included_files(cfg.roots, included_abs, cfg.tree_max_depth)
         print(tree)
 
     print("=== Dry Run: Included Files ===")
-    for d in included:
-        disp = rel_display_path(d.path, cfg.roots)
-        extra = ""
-        if d.truncated:
-            extra = f" [TRUNCATE to {d.read_bytes} bytes]"
-        print(f"[OK] {disp}{extra}")
-    if not included:
+    if included:
+        for d in included:
+            disp = rel_display_path(d.path, cfg.roots)
+            extra = ""
+            if d.truncated:
+                extra = f" [TRUNCATE to {d.read_bytes} bytes]"
+            print(f"[OK] {disp}{extra}")
+    else:
         print("(none)")
     print()
 
     print("=== Dry Run: Skipped Files ===")
-    for d in skipped:
-        disp = rel_display_path(d.path, cfg.roots)
-        detail = f" ({d.detail})" if d.detail else ""
-        print(f"[SKIP:{d.reason}] {disp}{detail}")
-    if not skipped:
+    if skipped:
+        for d in skipped:
+            disp = rel_display_path(d.path, cfg.roots)
+            detail = f" ({d.detail})" if d.detail else ""
+            print(f"[SKIP:{d.reason}] {disp}{detail}")
+    else:
         print("(none)")
     print()
 
-    # Summary
     skipped_by_reason: Dict[str, int] = {}
     for d in skipped:
         k = str(d.reason)
         skipped_by_reason[k] = skipped_by_reason.get(k, 0) + 1
 
     print("=== Dry Run Summary ===")
+    print(f"candidates(after excludes/gitignore): {len(candidate_abs)}")
     print(f"included: {len(included)}")
     print(f"skipped : {len(skipped)}")
     if skipped_by_reason:
@@ -1016,36 +931,16 @@ def parse_args() -> Config:
     p.add_argument("--instructions-file", default=None)
 
     # ADDITIVE excludes by default (built-ins are always applied)
-    p.add_argument(
-        "--exclude-dir",
-        nargs="*",
-        default=[],
-        help="Additional directory names to exclude (added to built-in defaults).",
-    )
-    p.add_argument(
-        "--exclude-file",
-        nargs="*",
-        default=[],
-        help="Additional file names to exclude (added to built-in defaults).",
-    )
-    p.add_argument(
-        "--exclude-glob",
-        nargs="*",
-        default=[],
-        help='Additional glob patterns to exclude (added to built-in defaults), e.g. "*.db" "**/data/**".',
-    )
+    p.add_argument("--exclude-dir", nargs="*", default=[], help="Additional directory names to exclude (added to built-in defaults).")
+    p.add_argument("--exclude-file", nargs="*", default=[], help="Additional file names to exclude (added to built-in defaults).")
+    p.add_argument("--exclude-glob", nargs="*", default=[], help='Additional glob patterns to exclude (added to built-in defaults), e.g. "*.db" "**/data/**".')
 
     # switches to disable built-in excludes
     p.add_argument("--no-default-exclude-dir", action="store_true", help="Do not use built-in default excluded directories.")
     p.add_argument("--no-default-exclude-file", action="store_true", help="Do not use built-in default excluded files.")
     p.add_argument("--no-default-exclude-glob", action="store_true", help="Do not use built-in default excluded glob patterns.")
 
-    p.add_argument(
-        "--exclude-path",
-        nargs="*",
-        default=[],
-        help='Explicit paths to exclude (relative or absolute). e.g. "data/secret.txt" "tmp/".',
-    )
+    p.add_argument("--exclude-path", nargs="*", default=[], help='Explicit paths to exclude (relative or absolute). e.g. "data/secret.txt" "tmp/".')
     p.add_argument("--exclude-path-substr", nargs="*", default=[])
 
     p.add_argument("--tree-max-depth", type=int, default=0)
@@ -1103,10 +998,10 @@ def parse_args() -> Config:
 
 def main() -> None:
     cfg = parse_args()
-    decisions, _gi = plan_files(cfg)
+    decisions, candidate_abs = plan_files(cfg)
 
     if cfg.dry_run:
-        print_dry_run_report(cfg, decisions)
+        print_dry_run_report(cfg, decisions, candidate_abs)
         return
 
     write_bundle(cfg, decisions)
