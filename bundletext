@@ -2,16 +2,21 @@
 """
 bundletext: Bundle (mostly) all non-binary files under given paths into one text file for LLM ingestion.
 
-New:
 - Respects .gitignore by default (basic support; can be disabled with --no-gitignore)
 - Supports wildcard exclusions via --exclude-glob (fnmatch-style globs)
 - Supports excluding specific paths via --exclude-path
+- If --follow-symlinks is enabled, follows symlinked files/dirs safely:
+  - Detects symlink cycles with realpath-based visited set
+  - De-duplicates identical targets (same realpath) so they are bundled once
 
-Examples:
-  bundletext . --out bundle_{date}_{time}.txt
-  bundletext . --exclude-glob "*.db" "*.csv" --out bundle.txt
-  bundletext . --exclude-path "data/secret.txt" "tmp/" --out bundle.txt
-  bundletext . --no-gitignore --out bundle.txt
+IMPORTANT (Updated behavior):
+- --exclude-dir / --exclude-file / --exclude-glob are now ADDITIVE by default:
+  - built-in defaults are always applied
+  - user-specified patterns are added
+- To disable built-in defaults:
+  --no-default-exclude-dir
+  --no-default-exclude-file
+  --no-default-exclude-glob
 """
 
 from __future__ import annotations
@@ -54,8 +59,7 @@ DEFAULT_EXCLUDE_FILE_NAMES: Set[str] = {
     "pnpm-lock.yaml",
 }
 
-# "By default, bundle non-binary files", but it’s still useful to exclude large/binary-ish datasets by default.
-# You can override/clear by passing --exclude-glob with your own list (or --exclude-glob "" if you want none).
+# Default globs: exclude "dataset / binary-ish / huge" files by default
 DEFAULT_EXCLUDE_GLOBS: Tuple[str, ...] = (
     "*.db",
     "*.sqlite",
@@ -169,22 +173,16 @@ def matches_any_glob(path: str, globs: Sequence[str]) -> bool:
     for g in globs:
         if not g:
             continue
-        # Try both basename and full path.
         if fnmatch.fnmatch(base, g) or fnmatch.fnmatch(p, g):
             return True
     return False
 
 
 def resolve_exclude_paths(cfg: Config) -> Set[str]:
-    """
-    Normalize explicit exclude paths to absolute normalized paths
-    so it works reliably regardless of cwd.
-    """
     out: Set[str] = set()
     for raw in cfg.exclude_paths:
         if not raw:
             continue
-        # If relative, resolve relative to current working directory
         abs_p = os.path.abspath(raw)
         out.add(os.path.normpath(abs_p))
     return out
@@ -210,6 +208,24 @@ def is_probably_text_file(path: str, sample_size: int = 4096) -> bool:
     return ratio >= 0.60
 
 
+def uniq_key(path: str, follow_symlinks: bool) -> str:
+    p = os.path.abspath(path)
+    return os.path.realpath(p) if follow_symlinks else p
+
+
+def dedup_preserve_order(items: Sequence[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for x in items:
+        if not x:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
 # -------------------------
 # Basic .gitignore support
 # -------------------------
@@ -223,7 +239,6 @@ def read_gitignore_lines(gitignore_path: str) -> List[str]:
                     continue
                 # NOTE: "!" negation not implemented in this basic version.
                 if s.startswith("!"):
-                    # ignore negation lines for now
                     continue
                 lines.append(s)
             return lines
@@ -232,13 +247,6 @@ def read_gitignore_lines(gitignore_path: str) -> List[str]:
 
 
 def gitignore_match(rel_path: str, patterns: Sequence[str]) -> bool:
-    """
-    Very small subset:
-    - "foo/" matches directory prefix
-    - "foo" matches file/dir name or path segment via fnmatch
-    - patterns can contain globs
-    - leading "/" anchors to root
-    """
     p = rel_path.lstrip("./")
     p = p.replace("\\", "/")
     base = os.path.basename(p)
@@ -247,24 +255,20 @@ def gitignore_match(rel_path: str, patterns: Sequence[str]) -> bool:
         anchored = pat.startswith("/")
         pat2 = pat[1:] if anchored else pat
 
-        # directory pattern
         if pat2.endswith("/"):
             d = pat2[:-1]
             if anchored:
                 if p == d or p.startswith(d + "/"):
                     return True
             else:
-                # match any segment prefix
                 if ("/" + d + "/") in ("/" + p + "/") or p.startswith(d + "/"):
                     return True
             continue
 
-        # file/path pattern
         if anchored:
             if fnmatch.fnmatch(p, pat2):
                 return True
         else:
-            # match either basename or anywhere in path
             if fnmatch.fnmatch(base, pat2) or fnmatch.fnmatch(p, f"**/{pat2}") or fnmatch.fnmatch(p, pat2):
                 return True
 
@@ -272,13 +276,7 @@ def gitignore_match(rel_path: str, patterns: Sequence[str]) -> bool:
 
 
 def build_gitignore_cache(root_dir: str) -> Dict[str, List[str]]:
-    """
-    Map directory absolute path -> aggregated patterns applying to that directory.
-    Aggregation rule:
-      patterns(dir) = patterns(parent) + lines(dir/.gitignore)
-    """
     cache: Dict[str, List[str]] = {}
-
     root_dir = os.path.abspath(root_dir)
     cache[root_dir] = []
 
@@ -292,7 +290,6 @@ def build_gitignore_cache(root_dir: str) -> Dict[str, List[str]]:
         if os.path.exists(gi) and os.path.isfile(gi):
             cache[cur_abs].extend(read_gitignore_lines(gi))
 
-        # ensure children will inherit (pre-seed)
         for d in subdirs:
             child = os.path.abspath(os.path.join(cur_abs, d))
             if child not in cache:
@@ -306,15 +303,15 @@ def is_ignored_by_gitignore(
     root_dir_abs: str,
     gitignore_cache: Dict[str, List[str]],
 ) -> bool:
-    """
-    Decide based on the patterns aggregated for the directory containing the path.
-    """
     dir_abs = os.path.dirname(path_abs)
     patterns = gitignore_cache.get(dir_abs, [])
     if not patterns:
         return False
 
     rel = os.path.relpath(path_abs, root_dir_abs).replace(os.sep, "/")
+    if rel.startswith(".."):
+        return False
+
     return gitignore_match(rel, patterns)
 
 
@@ -333,6 +330,9 @@ def iter_files_under_root(
     if not os.path.exists(root):
         return
 
+    visited_real_dirs: Set[str] = set()
+    visited_real_files: Set[str] = set()
+
     if os.path.isfile(root):
         if os.path.basename(root) in exclude_file_names:
             return
@@ -343,9 +343,12 @@ def iter_files_under_root(
             return
         if matches_any_glob(abs_p, cfg.exclude_globs):
             return
-        if cfg.use_gitignore and gitignore_cache and os.path.isdir(os.path.dirname(abs_p)):
-            # root file belongs to some dir; only apply if root is under its dir root (handled elsewhere)
-            pass
+
+        rk = uniq_key(abs_p, cfg.follow_symlinks)
+        if cfg.follow_symlinks and rk in visited_real_files:
+            return
+        visited_real_files.add(rk)
+
         yield root
         return
 
@@ -354,7 +357,13 @@ def iter_files_under_root(
     for cur, subdirs, files in os.walk(root, followlinks=cfg.follow_symlinks):
         cur_abs = os.path.abspath(cur)
 
-        # depth limiting relative to this root
+        if cfg.follow_symlinks:
+            cur_real = os.path.realpath(cur_abs)
+            if cur_real in visited_real_dirs:
+                subdirs[:] = []
+                continue
+            visited_real_dirs.add(cur_real)
+
         if cfg.tree_max_depth > 0:
             rel = os.path.relpath(cur, root)
             depth = 0 if rel == "." else rel.count(os.sep) + 1
@@ -362,10 +371,8 @@ def iter_files_under_root(
                 subdirs[:] = []
                 continue
 
-        # exclude dirs by name
         subdirs[:] = [d for d in subdirs if d not in exclude_dir_names]
 
-        # skip subtree by substring/glob/explicit path
         if should_skip_by_substr(cur_abs, cfg.exclude_path_substr):
             subdirs[:] = []
             continue
@@ -392,6 +399,11 @@ def iter_files_under_root(
             if cfg.use_gitignore and gitignore_cache:
                 if is_ignored_by_gitignore(full_abs, root_abs, gitignore_cache):
                     continue
+
+            rk = uniq_key(full_abs, cfg.follow_symlinks)
+            if cfg.follow_symlinks and rk in visited_real_files:
+                continue
+            visited_real_files.add(rk)
 
             yield full
 
@@ -420,8 +432,17 @@ def generate_tree_for_roots(
 
         gi_cache = gitignore_caches.get(root_abs)
 
+        visited_real_dirs: Set[str] = set()
+
         for cur, subdirs, files in os.walk(root, followlinks=cfg.follow_symlinks):
             cur_abs = os.path.abspath(cur)
+
+            if cfg.follow_symlinks:
+                cur_real = os.path.realpath(cur_abs)
+                if cur_real in visited_real_dirs:
+                    subdirs[:] = []
+                    continue
+                visited_real_dirs.add(cur_real)
 
             rel = os.path.relpath(cur, root)
             depth = 0 if rel == "." else rel.count(os.sep) + 1
@@ -504,7 +525,6 @@ def write_bundle(cfg: Config) -> int:
     out_path = expand_out_path(cfg.out)
     instructions = read_instructions(cfg.instructions_file)
 
-    # build gitignore caches per root dir (only for directory roots)
     gitignore_caches: Dict[str, Dict[str, List[str]]] = {}
     if cfg.use_gitignore:
         for r in cfg.roots:
@@ -523,7 +543,7 @@ def write_bundle(cfg: Config) -> int:
             gitignore_caches,
         )
 
-    files: List[str] = []
+    uniq_map: Dict[str, str] = {}
     for r in cfg.roots:
         r_abs = os.path.abspath(r)
         gi_cache = gitignore_caches.get(r_abs)
@@ -535,9 +555,10 @@ def write_bundle(cfg: Config) -> int:
             exclude_paths_abs,
             gi_cache,
         ):
-            files.append(fp)
+            key = uniq_key(fp, cfg.follow_symlinks)
+            uniq_map.setdefault(key, fp)
 
-    files = sorted(set(files))
+    files = sorted(uniq_map.values())
 
     if out_path == "-":
         out_f = sys.stdout
@@ -558,12 +579,10 @@ def write_bundle(cfg: Config) -> int:
         out_f.write("=== File Contents ===\n\n")
 
         for fp in files:
-            # skip binary-ish
             if not is_probably_text_file(fp):
                 skipped_binary += 1
                 continue
 
-            # size control
             try:
                 size = os.path.getsize(fp)
             except Exception:
@@ -626,14 +645,41 @@ def parse_args() -> Config:
 
     p.add_argument("--instructions-file", default=None)
 
-    p.add_argument("--exclude-dir", nargs="*", default=sorted(DEFAULT_EXCLUDE_DIR_NAMES))
-    p.add_argument("--exclude-file", nargs="*", default=sorted(DEFAULT_EXCLUDE_FILE_NAMES))
-
+    # ADDITIVE excludes by default (built-ins are always applied)
+    p.add_argument(
+        "--exclude-dir",
+        nargs="*",
+        default=[],
+        help="Additional directory names to exclude (added to built-in defaults).",
+    )
+    p.add_argument(
+        "--exclude-file",
+        nargs="*",
+        default=[],
+        help="Additional file names to exclude (added to built-in defaults).",
+    )
     p.add_argument(
         "--exclude-glob",
         nargs="*",
-        default=list(DEFAULT_EXCLUDE_GLOBS),
-        help='Glob patterns to exclude, e.g. "*.db" "**/data/**". Matched against basename and full path.',
+        default=[],
+        help='Additional glob patterns to exclude (added to built-in defaults), e.g. "*.db" "**/data/**".',
+    )
+
+    # switches to disable built-in excludes
+    p.add_argument(
+        "--no-default-exclude-dir",
+        action="store_true",
+        help="Do not use built-in default excluded directories.",
+    )
+    p.add_argument(
+        "--no-default-exclude-file",
+        action="store_true",
+        help="Do not use built-in default excluded files.",
+    )
+    p.add_argument(
+        "--no-default-exclude-glob",
+        action="store_true",
+        help="Do not use built-in default excluded glob patterns.",
     )
 
     p.add_argument(
@@ -642,7 +688,6 @@ def parse_args() -> Config:
         default=[],
         help='Explicit paths to exclude (relative or absolute). e.g. "data/secret.txt" "tmp/".',
     )
-
     p.add_argument("--exclude-path-substr", nargs="*", default=[])
 
     p.add_argument("--tree-max-depth", type=int, default=0)
@@ -662,14 +707,23 @@ def parse_args() -> Config:
 
     a = p.parse_args()
 
+    # Merge excludes (defaults + user additions), with an escape hatch to disable defaults
+    base_dirs = [] if a.no_default_exclude_dir else sorted(DEFAULT_EXCLUDE_DIR_NAMES)
+    base_files = [] if a.no_default_exclude_file else sorted(DEFAULT_EXCLUDE_FILE_NAMES)
+    base_globs = [] if a.no_default_exclude_glob else list(DEFAULT_EXCLUDE_GLOBS)
+
+    merged_dirs = dedup_preserve_order(list(base_dirs) + list(a.exclude_dir))
+    merged_files = dedup_preserve_order(list(base_files) + list(a.exclude_file))
+    merged_globs = dedup_preserve_order(list(base_globs) + list(a.exclude_glob))
+
     return Config(
         roots=tuple(a.paths),
         out=a.out,
         instructions_file=a.instructions_file,
-        exclude_dir_names=tuple(a.exclude_dir),
-        exclude_file_names=tuple(a.exclude_file),
+        exclude_dir_names=tuple(merged_dirs),
+        exclude_file_names=tuple(merged_files),
         exclude_path_substr=tuple(a.exclude_path_substr),
-        exclude_globs=tuple(a.exclude_glob),
+        exclude_globs=tuple(merged_globs),
         exclude_paths=tuple(a.exclude_path),
         tree_max_depth=a.tree_max_depth,
         include_tree=(not a.no_tree),

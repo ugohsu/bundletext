@@ -14,7 +14,7 @@
 LLM を使った作業では、次のような情報を **まとめて渡したい**場面がよくあります。
 
 - プロジェクト全体の構成
-- README や設計ドキュメント
+- README や設計ドキュメント（存在すれば）
 - 実際のソースコードや設定ファイル
 
 これを手作業でコピーすると、
@@ -42,6 +42,7 @@ LLM を使った作業では、次のような情報を **まとめて渡した�
   - glob パターン（`*.db`, `**/data/**` など）
   - 明示的なパス指定
 - 🌳 プロジェクトツリーの自動生成（ON/OFF可）
+- 🔗 シンボリックリンク対応（オプション）
 - 🔁 ソート済み・再現可能な出力
 - 🔌 標準出力対応（パイプで利用可能）
 
@@ -56,7 +57,7 @@ git clone https://github.com/ugohsu/bundletext.git
 cd bundletext
 chmod +x bundletext
 sudo mv bundletext /usr/local/bin/
-````
+```
 
 （`~/bin` などでも問題ありません）
 
@@ -113,7 +114,7 @@ bundletext . --out bundle_{date}_{time}.txt
 デフォルトでは、`.gitignore` を再帰的に読み込み、
 Git と同様の感覚でファイルを除外します。
 
-無効化したい場合は次のように指定してください。
+無効化したい場合：
 
 ```bash
 bundletext . --no-gitignore --out bundle.txt
@@ -124,29 +125,49 @@ bundletext . --no-gitignore --out bundle.txt
 
 ---
 
-## ファイルの除外方法
+## ファイル・ディレクトリの除外仕様（重要）
 
-### glob パターンで除外
+### デフォルト除外について
+
+`bundletext` には **事故を防ぐためのデフォルト除外**が組み込まれています。
+
+例：
+
+* `.git`, `node_modules`, `.venv`
+* `__pycache__`
+* `*.db`, `*.csv`, `*.zip` など
+
+### 追加指定（デフォルト）
+
+`--exclude-dir`, `--exclude-file`, `--exclude-glob` は
+**デフォルト除外に「追加」されます**。
+
+```bash
+bundletext . --exclude-dir data logs --out bundle.txt
+```
+
+→
+`.git` や `.venv` などのデフォルト除外は **維持**され、
+`data/`, `logs/` が追加で除外されます。
+
+### デフォルト除外を無効化したい場合
+
+```bash
+bundletext . \
+  --no-default-exclude-dir \
+  --no-default-exclude-file \
+  --no-default-exclude-glob \
+  --exclude-dir data \
+  --out bundle.txt
+```
+
+---
+
+## glob パターンでの除外
 
 ```bash
 bundletext . \
   --exclude-glob "*.db" "*.csv" "**/data/**" \
-  --out bundle.txt
-```
-
-### 特定のファイル・パスを除外
-
-```bash
-bundletext . \
-  --exclude-path data/secret.txt tmp/debug.log \
-  --out bundle.txt
-```
-
-### パスの部分一致で除外
-
-```bash
-bundletext . \
-  --exclude-path-substr "/outputs/" "/cache/" \
   --out bundle.txt
 ```
 
@@ -172,6 +193,22 @@ bundletext . \
   --truncate-bytes 120000 \
   --out bundle.txt
 ```
+
+---
+
+## シンボリックリンクの扱い
+
+デフォルトでは、シンボリックリンクは辿りません。
+
+リンク先の実体も含めたい場合：
+
+```bash
+bundletext . --follow-symlinks --out bundle.txt
+```
+
+* ファイル／ディレクトリのシンボリックリンクを辿ります
+* 循環参照は **realpath ベースで自動検出・回避**されます
+* 同一実体は 1 度だけ bundle されます
 
 ---
 
@@ -215,4 +252,8 @@ bundletext . --tree-max-depth 3 --out bundle.txt
 * 巨大リポジトリでは追加の除外指定が必要な場合があります
 
 ---
+
+## ライセンス
+
+MIT License
 
