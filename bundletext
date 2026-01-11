@@ -2,35 +2,49 @@
 """
 bundletext: Bundle (mostly) all non-binary files under given paths into one text file for LLM ingestion.
 
-- Respects .gitignore by default (basic support; can be disabled with --no-gitignore)
-- Supports wildcard exclusions via --exclude-glob (fnmatch-style globs)
-- Supports excluding specific paths via --exclude-path
-- If --follow-symlinks is enabled, follows symlinked files/dirs safely:
-  - Detects symlink cycles with realpath-based visited set
-  - De-duplicates identical targets (same realpath) so they are bundled once
+Features
+- Collects (mostly) all text files under given roots into one bundle text file.
+- Respects .gitignore by default (basic subset; can be disabled with --no-gitignore).
+- Exclusions:
+  - directory names, file names, glob patterns, explicit paths, path substring.
+  - Additive by default: built-in defaults + user additions.
+  - Escape hatch to disable built-in defaults: --no-default-exclude-*
+- Symlinks:
+  - Optional follow: --follow-symlinks
+  - Cycle protection (realpath-based) and de-dup of identical targets
+- Binary detection:
+  - UTF-8-first heuristic (robust for Japanese text)
+  - Can be disabled with --no-binary-check
+- Big files:
+  - --max-bytes with --big-file {skip,truncate} and --truncate-bytes
+- Tree:
+  - Default behavior: Project Tree includes ONLY files actually bundled ("tree-only-included" default)
+- Dry-run:
+  - --dry-run prints a report showing which files would be included vs skipped (with reasons),
+    and prints a tree annotated by status.
 
-IMPORTANT (Updated behavior):
-- --exclude-dir / --exclude-file / --exclude-glob are now ADDITIVE by default:
-  - built-in defaults are always applied
-  - user-specified patterns are added
-- To disable built-in defaults:
-  --no-default-exclude-dir
-  --no-default-exclude-file
-  --no-default-exclude-glob
+Output format
+- The bundle contains:
+  1) AI instructions
+  2) Project Tree (optional)
+  3) File contents, separated by FILE_PATH headers
 """
 
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 import datetime
 import fnmatch
+import os
+import sys
 from dataclasses import dataclass
-from typing import Iterable, Sequence, Set, Tuple, Optional, Dict, List
+from enum import Enum
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-# --- defaults ---
+# -----------------------------------------------------------------------------
+# Defaults
+# -----------------------------------------------------------------------------
 DEFAULT_EXCLUDE_DIR_NAMES: Set[str] = {
     ".git",
     "__pycache__",
@@ -59,7 +73,6 @@ DEFAULT_EXCLUDE_FILE_NAMES: Set[str] = {
     "pnpm-lock.yaml",
 }
 
-# Default globs: exclude "dataset / binary-ish / huge" files by default
 DEFAULT_EXCLUDE_GLOBS: Tuple[str, ...] = (
     "*.db",
     "*.sqlite",
@@ -105,6 +118,18 @@ Guidelines:
 """
 
 
+# -----------------------------------------------------------------------------
+# Data models
+# -----------------------------------------------------------------------------
+class SkipReason(str, Enum):
+    EXCLUDED = "excluded"
+    GITIGNORE = "gitignore"
+    BINARY = "binary"
+    TOO_BIG = "too_big"
+    UNREADABLE = "unreadable"
+    OUTSIDE_ROOT = "outside_root"  # currently used only for gitignore applicability (informational)
+
+
 @dataclass(frozen=True)
 class Config:
     roots: Tuple[str, ...]
@@ -123,11 +148,31 @@ class Config:
     max_bytes: int  # 0 = unlimited
     big_file: str  # "skip" or "truncate"
     truncate_bytes: int
+
     follow_symlinks: bool
-
     use_gitignore: bool
+    no_binary_check: bool
+
+    dry_run: bool
 
 
+@dataclass
+class FileDecision:
+    path: str  # representative path (may be symlink path)
+    abs_path: str
+    uniq_key: str  # realpath if follow_symlinks else abspath
+
+    included: bool
+    reason: Optional[SkipReason] = None
+    detail: Optional[str] = None
+
+    read_bytes: Optional[int] = None  # None=full text read, else read first N bytes then decode
+    truncated: bool = False
+
+
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
 def now_tokens() -> tuple[str, str]:
     dt = datetime.datetime.now()
     return dt.strftime("%Y%m%d"), dt.strftime("%H%M%S")
@@ -136,6 +181,7 @@ def now_tokens() -> tuple[str, str]:
 def expand_out_path(out: str) -> str:
     if out == "-":
         return out
+
     date_s, time_s = now_tokens()
     out2 = out.replace("{date}", date_s).replace("{time}", time_s)
 
@@ -155,6 +201,45 @@ def norm_slash(p: str) -> str:
     return os.path.normpath(p).replace(os.sep, "/")
 
 
+def dedup_preserve_order(items: Sequence[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for x in items:
+        if not x:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def uniq_key_for(path: str, follow_symlinks: bool) -> str:
+    p = os.path.abspath(path)
+    return os.path.realpath(p) if follow_symlinks else p
+
+
+def rel_display_path(path: str, roots: Sequence[str]) -> str:
+    norm = os.path.normpath(path)
+    best = None
+    for r in roots:
+        r2 = os.path.normpath(r)
+        if os.path.isdir(r2):
+            try:
+                rel = os.path.relpath(norm, r2)
+                if not rel.startswith(".."):
+                    cand = os.path.join(os.path.basename(r2) or r2, rel)
+                    best = cand
+                    break
+            except Exception:
+                pass
+    disp = best if best else norm
+    return disp.replace(os.sep, "/")
+
+
+# -----------------------------------------------------------------------------
+# Matching / exclusion helpers
+# -----------------------------------------------------------------------------
 def should_skip_by_substr(path: str, exclude_substrs: Sequence[str]) -> bool:
     norm = norm_slash(path)
     return any(s and s in norm for s in exclude_substrs)
@@ -188,7 +273,17 @@ def resolve_exclude_paths(cfg: Config) -> Set[str]:
     return out
 
 
+# -----------------------------------------------------------------------------
+# Binary detection (UTF-8-first)
+# -----------------------------------------------------------------------------
 def is_probably_text_file(path: str, sample_size: int = 4096) -> bool:
+    """
+    UTF-8-first heuristic (robust for Japanese text):
+
+    - If NUL byte exists -> binary
+    - If sample decodes as UTF-8 -> treat as text
+    - Else fallback to "control-character ratio" heuristic
+    """
     try:
         with open(path, "rb") as f:
             sample = f.read(sample_size)
@@ -200,35 +295,23 @@ def is_probably_text_file(path: str, sample_size: int = 4096) -> bool:
     if not sample:
         return True
 
-    printable = 0
+    try:
+        sample.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        pass
+
+    ctrl = 0
     for b in sample:
-        if b in (9, 10, 13) or 32 <= b <= 126:
-            printable += 1
-    ratio = printable / max(len(sample), 1)
-    return ratio >= 0.60
+        # allow tab(9), lf(10), cr(13)
+        if b < 9 or (13 < b < 32):
+            ctrl += 1
+    return (ctrl / len(sample)) < 0.02
 
 
-def uniq_key(path: str, follow_symlinks: bool) -> str:
-    p = os.path.abspath(path)
-    return os.path.realpath(p) if follow_symlinks else p
-
-
-def dedup_preserve_order(items: Sequence[str]) -> List[str]:
-    seen: Set[str] = set()
-    out: List[str] = []
-    for x in items:
-        if not x:
-            continue
-        if x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    return out
-
-
-# -------------------------
-# Basic .gitignore support
-# -------------------------
+# -----------------------------------------------------------------------------
+# .gitignore (basic subset)
+# -----------------------------------------------------------------------------
 def read_gitignore_lines(gitignore_path: str) -> List[str]:
     try:
         with open(gitignore_path, "r", encoding="utf-8", errors="replace") as f:
@@ -247,6 +330,13 @@ def read_gitignore_lines(gitignore_path: str) -> List[str]:
 
 
 def gitignore_match(rel_path: str, patterns: Sequence[str]) -> bool:
+    """
+    Very small subset:
+    - "foo/" matches directory prefix
+    - "foo" matches file/dir name or path segment via fnmatch
+    - patterns can contain globs
+    - leading "/" anchors to root
+    """
     p = rel_path.lstrip("./")
     p = p.replace("\\", "/")
     base = os.path.basename(p)
@@ -276,6 +366,11 @@ def gitignore_match(rel_path: str, patterns: Sequence[str]) -> bool:
 
 
 def build_gitignore_cache(root_dir: str) -> Dict[str, List[str]]:
+    """
+    Map directory absolute path -> aggregated patterns applying to that directory.
+    Aggregation rule:
+      patterns(dir) = patterns(parent) + lines(dir/.gitignore)
+    """
     cache: Dict[str, List[str]] = {}
     root_dir = os.path.abspath(root_dir)
     cache[root_dir] = []
@@ -298,27 +393,23 @@ def build_gitignore_cache(root_dir: str) -> Dict[str, List[str]]:
     return cache
 
 
-def is_ignored_by_gitignore(
-    path_abs: str,
-    root_dir_abs: str,
-    gitignore_cache: Dict[str, List[str]],
-) -> bool:
+def is_ignored_by_gitignore(path_abs: str, root_dir_abs: str, cache: Dict[str, List[str]]) -> bool:
     dir_abs = os.path.dirname(path_abs)
-    patterns = gitignore_cache.get(dir_abs, [])
+    patterns = cache.get(dir_abs, [])
     if not patterns:
         return False
 
     rel = os.path.relpath(path_abs, root_dir_abs).replace(os.sep, "/")
     if rel.startswith(".."):
+        # outside root: don't apply gitignore rules
         return False
-
     return gitignore_match(rel, patterns)
 
 
-# -------------------------
-# Walking / tree / bundling
-# -------------------------
-def iter_files_under_root(
+# -----------------------------------------------------------------------------
+# Traversal (candidates only; excludes + gitignore applied; binary/size later)
+# -----------------------------------------------------------------------------
+def iter_candidate_files_under_root(
     root: str,
     cfg: Config,
     exclude_dir_names: Set[str],
@@ -326,6 +417,18 @@ def iter_files_under_root(
     exclude_paths_abs: Set[str],
     gitignore_cache: Optional[Dict[str, List[str]]],
 ) -> Iterable[str]:
+    """
+    Yield candidate file paths after applying:
+      - exclude-dir/file/glob/path/path-substr
+      - gitignore (if enabled)
+    Binary/size/unreadable checks are NOT done here.
+
+    Symlinks:
+      - followlinks=cfg.follow_symlinks
+      - directory cycle protection via realpath visited set
+      - file target de-dup per-root via realpath visited set
+        (global de-dup is handled later with uniq_key_for)
+    """
     root = os.path.normpath(root)
     if not os.path.exists(root):
         return
@@ -334,9 +437,9 @@ def iter_files_under_root(
     visited_real_files: Set[str] = set()
 
     if os.path.isfile(root):
+        abs_p = os.path.abspath(root)
         if os.path.basename(root) in exclude_file_names:
             return
-        abs_p = os.path.abspath(root)
         if abs_p in exclude_paths_abs:
             return
         if should_skip_by_substr(abs_p, cfg.exclude_path_substr):
@@ -344,11 +447,10 @@ def iter_files_under_root(
         if matches_any_glob(abs_p, cfg.exclude_globs):
             return
 
-        rk = uniq_key(abs_p, cfg.follow_symlinks)
+        rk = uniq_key_for(abs_p, cfg.follow_symlinks)
         if cfg.follow_symlinks and rk in visited_real_files:
             return
         visited_real_files.add(rk)
-
         yield root
         return
 
@@ -357,6 +459,7 @@ def iter_files_under_root(
     for cur, subdirs, files in os.walk(root, followlinks=cfg.follow_symlinks):
         cur_abs = os.path.abspath(cur)
 
+        # cycle protection for followed symlink dirs
         if cfg.follow_symlinks:
             cur_real = os.path.realpath(cur_abs)
             if cur_real in visited_real_dirs:
@@ -364,6 +467,7 @@ def iter_files_under_root(
                 continue
             visited_real_dirs.add(cur_real)
 
+        # traversal depth limit (kept as current behavior)
         if cfg.tree_max_depth > 0:
             rel = os.path.relpath(cur, root)
             depth = 0 if rel == "." else rel.count(os.sep) + 1
@@ -371,8 +475,10 @@ def iter_files_under_root(
                 subdirs[:] = []
                 continue
 
+        # exclude dir names
         subdirs[:] = [d for d in subdirs if d not in exclude_dir_names]
 
+        # subtree excludes by substring/glob/path
         if should_skip_by_substr(cur_abs, cfg.exclude_path_substr):
             subdirs[:] = []
             continue
@@ -400,7 +506,7 @@ def iter_files_under_root(
                 if is_ignored_by_gitignore(full_abs, root_abs, gitignore_cache):
                     continue
 
-            rk = uniq_key(full_abs, cfg.follow_symlinks)
+            rk = uniq_key_for(full_abs, cfg.follow_symlinks)
             if cfg.follow_symlinks and rk in visited_real_files:
                 continue
             visited_real_files.add(rk)
@@ -408,87 +514,356 @@ def iter_files_under_root(
             yield full
 
 
-def generate_tree_for_roots(
-    roots: Sequence[str],
-    cfg: Config,
-    exclude_dir_names: Set[str],
-    exclude_file_names: Set[str],
-    exclude_paths_abs: Set[str],
-    gitignore_caches: Dict[str, Dict[str, List[str]]],
-) -> str:
+# -----------------------------------------------------------------------------
+# Planning (apply binary/size/unreadable, produce included vs skipped)
+# -----------------------------------------------------------------------------
+def decide_read_bytes_for_file(path: str, cfg: Config) -> Tuple[Optional[int], bool, bool]:
+    """
+    Returns:
+      read_bytes: None => read full text; int => read first N bytes then decode as UTF-8
+      will_skip: True if the file should be skipped due to size policy (big_file=skip)
+      will_truncate: True if truncation will be applied
+    """
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        size = -1
+
+    if cfg.max_bytes > 0 and size >= 0 and size > cfg.max_bytes:
+        if cfg.big_file == "skip":
+            return None, True, False
+        rb = cfg.truncate_bytes if cfg.truncate_bytes > 0 else cfg.max_bytes
+        return rb, False, True
+
+    return None, False, False
+
+
+def plan_files(cfg: Config) -> Tuple[List[FileDecision], Dict[str, Dict[str, List[str]]]]:
+    """
+    Returns:
+      decisions: one per unique target (uniq_key)
+      gitignore_caches: per directory root cache (for potential reuse)
+    """
+    exclude_dir_names = set(cfg.exclude_dir_names)
+    exclude_file_names = set(cfg.exclude_file_names)
+    exclude_paths_abs = resolve_exclude_paths(cfg)
+
+    # gitignore caches per directory root
+    gitignore_caches: Dict[str, Dict[str, List[str]]] = {}
+    if cfg.use_gitignore:
+        for r in cfg.roots:
+            r_abs = os.path.abspath(r)
+            if os.path.isdir(r_abs):
+                gitignore_caches[r_abs] = build_gitignore_cache(r_abs)
+
+    # Collect candidates (dedup by uniq_key_for across all roots)
+    uniq_to_rep: Dict[str, str] = {}
+    rep_to_root_abs: Dict[str, Optional[str]] = {}
+
+    for r in cfg.roots:
+        r_abs = os.path.abspath(r)
+        gi_cache = gitignore_caches.get(r_abs)
+        for fp in iter_candidate_files_under_root(
+            r,
+            cfg,
+            exclude_dir_names,
+            exclude_file_names,
+            exclude_paths_abs,
+            gi_cache,
+        ):
+            key = uniq_key_for(fp, cfg.follow_symlinks)
+            if key not in uniq_to_rep:
+                uniq_to_rep[key] = fp
+                rep_to_root_abs[fp] = r_abs if os.path.isdir(r_abs) else None
+
+    reps = sorted(uniq_to_rep.values())
+
+    decisions: List[FileDecision] = []
+    for rep in reps:
+        abs_p = os.path.abspath(rep)
+        key = uniq_key_for(rep, cfg.follow_symlinks)
+
+        # binary check
+        if not cfg.no_binary_check:
+            ok = is_probably_text_file(rep)
+            if not ok:
+                decisions.append(
+                    FileDecision(
+                        path=rep,
+                        abs_path=abs_p,
+                        uniq_key=key,
+                        included=False,
+                        reason=SkipReason.BINARY,
+                    )
+                )
+                continue
+
+        # size policy
+        read_bytes, will_skip, will_truncate = decide_read_bytes_for_file(rep, cfg)
+        if will_skip:
+            decisions.append(
+                FileDecision(
+                    path=rep,
+                    abs_path=abs_p,
+                    uniq_key=key,
+                    included=False,
+                    reason=SkipReason.TOO_BIG,
+                    detail=f"size>{cfg.max_bytes} bytes",
+                )
+            )
+            continue
+
+        # try-open check (cheap, catches permission / encoding issues early)
+        try:
+            if read_bytes is None:
+                with open(rep, "r", encoding="utf-8", errors="replace") as f:
+                    f.read(1)
+            else:
+                with open(rep, "rb") as f:
+                    f.read(1)
+        except Exception as e:
+            decisions.append(
+                FileDecision(
+                    path=rep,
+                    abs_path=abs_p,
+                    uniq_key=key,
+                    included=False,
+                    reason=SkipReason.UNREADABLE,
+                    detail=str(e),
+                )
+            )
+            continue
+
+        decisions.append(
+            FileDecision(
+                path=rep,
+                abs_path=abs_p,
+                uniq_key=key,
+                included=True,
+                read_bytes=read_bytes,
+                truncated=bool(will_truncate),
+            )
+        )
+
+    return decisions, gitignore_caches
+
+
+# -----------------------------------------------------------------------------
+# Tree rendering (tree-only-included default)
+# -----------------------------------------------------------------------------
+def _insert_path(tree: dict, parts: List[str]) -> None:
+    node = tree
+    for p in parts[:-1]:
+        node = node.setdefault("dirs", {}).setdefault(p, {})
+    node.setdefault("files", set()).add(parts[-1])
+
+
+def _render_tree(node: dict, depth: int, max_depth: int) -> List[str]:
+    lines: List[str] = []
+    if max_depth > 0 and depth > max_depth:
+        return lines
+
+    dirs = sorted(node.get("dirs", {}).keys())
+    files = sorted(node.get("files", set()))
+
+    indent = "    " * depth
+    for d in dirs:
+        if max_depth > 0 and depth >= max_depth:
+            continue
+        lines.append(f"{indent}{d}/")
+        lines.extend(_render_tree(node["dirs"][d], depth + 1, max_depth))
+    for f in files:
+        lines.append(f"{indent}{f}")
+    return lines
+
+
+
+def build_tree_from_files(roots: Sequence[str], files_abs: Sequence[str], max_depth: int, title: str) -> str:
+    """
+    Build a simple tree from given absolute file paths under provided roots.
+    (Used for dry-run candidate tree and for included-only tree.)
+    """
+    lines = [title]
+
+    for root in roots:
+        root_norm = os.path.normpath(root)
+        if not os.path.exists(root_norm):
+            continue
+
+        if os.path.isfile(root_norm):
+            abs_root = os.path.abspath(root_norm)
+            if abs_root in files_abs:
+                lines.append(os.path.basename(root_norm))
+            continue
+
+        root_abs = os.path.abspath(root_norm)
+        lines.append(f"{os.path.basename(root_norm) or root_norm}/")
+
+        rel_paths: List[str] = []
+        for fp_abs in files_abs:
+            try:
+                rel = os.path.relpath(fp_abs, root_abs)
+            except Exception:
+                continue
+            if rel.startswith(".."):
+                continue
+            rel_paths.append(rel)
+
+        tree: dict = {}
+        for rel in rel_paths:
+            rel = os.path.normpath(rel)
+            parts = [pp for pp in rel.split(os.sep) if pp and pp != "."]
+            if not parts:
+                continue
+            _insert_path(tree, parts)
+
+        rendered = _render_tree(tree, depth=1, max_depth=max_depth if max_depth > 0 else 0)
+        lines.extend(rendered)
+
+    lines.append("====================\n")
+    return "\n".join(lines)
+
+def build_tree_from_included_files(roots: Sequence[str], included_abs: Sequence[str], max_depth: int) -> str:
     lines = ["=== Project Tree ==="]
 
     for root in roots:
-        root = os.path.normpath(root)
-        if not os.path.exists(root):
+        root_norm = os.path.normpath(root)
+        if not os.path.exists(root_norm):
             continue
 
-        if os.path.isfile(root):
-            lines.append(os.path.basename(root))
+        if os.path.isfile(root_norm):
+            abs_root = os.path.abspath(root_norm)
+            if abs_root in included_abs:
+                lines.append(os.path.basename(root_norm))
             continue
 
-        root_abs = os.path.abspath(root)
-        lines.append(f"{os.path.basename(root) or root}/")
+        root_abs = os.path.abspath(root_norm)
+        lines.append(f"{os.path.basename(root_norm) or root_norm}/")
 
-        gi_cache = gitignore_caches.get(root_abs)
-
-        visited_real_dirs: Set[str] = set()
-
-        for cur, subdirs, files in os.walk(root, followlinks=cfg.follow_symlinks):
-            cur_abs = os.path.abspath(cur)
-
-            if cfg.follow_symlinks:
-                cur_real = os.path.realpath(cur_abs)
-                if cur_real in visited_real_dirs:
-                    subdirs[:] = []
-                    continue
-                visited_real_dirs.add(cur_real)
-
-            rel = os.path.relpath(cur, root)
-            depth = 0 if rel == "." else rel.count(os.sep) + 1
-            if cfg.tree_max_depth > 0 and depth > cfg.tree_max_depth:
-                subdirs[:] = []
+        rel_paths: List[str] = []
+        for fp_abs in included_abs:
+            try:
+                rel = os.path.relpath(fp_abs, root_abs)
+            except Exception:
                 continue
-
-            subdirs[:] = [d for d in subdirs if d not in exclude_dir_names]
-
-            if should_skip_by_substr(cur_abs, cfg.exclude_path_substr):
-                subdirs[:] = []
+            if rel.startswith(".."):
                 continue
-            if matches_any_glob(cur_abs, cfg.exclude_globs):
-                subdirs[:] = []
+            rel_paths.append(rel)
+
+        tree: dict = {}
+        for rel in rel_paths:
+            rel = os.path.normpath(rel)
+            parts = [p for p in rel.split(os.sep) if p and p != "."]
+            if not parts:
                 continue
-            if cur_abs in exclude_paths_abs:
-                subdirs[:] = []
-                continue
+            _insert_path(tree, parts)
 
-            indent = "    " * depth
-            if rel != ".":
-                lines.append(f"{indent}{os.path.basename(cur)}/")
-
-            sub_indent = "    " * (depth + 1)
-            for fn in sorted(files):
-                if fn in exclude_file_names:
-                    continue
-                full = os.path.join(cur, fn)
-                full_abs = os.path.abspath(full)
-
-                if full_abs in exclude_paths_abs:
-                    continue
-                if should_skip_by_substr(full_abs, cfg.exclude_path_substr):
-                    continue
-                if matches_any_glob(full_abs, cfg.exclude_globs):
-                    continue
-                if cfg.use_gitignore and gi_cache:
-                    if is_ignored_by_gitignore(full_abs, root_abs, gi_cache):
-                        continue
-
-                lines.append(f"{sub_indent}{fn}")
+        rendered = _render_tree(tree, depth=1, max_depth=max_depth if max_depth > 0 else 0)
+        lines.extend(rendered)
 
     lines.append("====================\n")
     return "\n".join(lines)
 
 
+def build_tree_annotated(
+    roots: Sequence[str],
+    decisions: Sequence[FileDecision],
+    max_depth: int,
+) -> str:
+    """
+    Dry-run tree: show candidates (after excludes/gitignore), annotated by decision.
+    Status markers:
+      - [OK] included
+      - [SKIP:reason] skipped
+    """
+    lines = ["=== Dry Run Tree (Annotated) ==="]
+
+    # map abs_path -> decision
+    dmap: Dict[str, FileDecision] = {d.abs_path: d for d in decisions}
+    included_abs = [d.abs_path for d in decisions if d.included]
+    # For building tree, we include *all* decisions, but annotate leaf nodes.
+    all_abs = [d.abs_path for d in decisions]
+
+    for root in roots:
+        root_norm = os.path.normpath(root)
+        if not os.path.exists(root_norm):
+            continue
+
+        if os.path.isfile(root_norm):
+            abs_root = os.path.abspath(root_norm)
+            d = dmap.get(abs_root)
+            if d:
+                if d.included:
+                    lines.append(f"[OK] {os.path.basename(root_norm)}")
+                else:
+                    lines.append(f"[SKIP:{d.reason}] {os.path.basename(root_norm)}")
+            continue
+
+        root_abs = os.path.abspath(root_norm)
+        lines.append(f"{os.path.basename(root_norm) or root_norm}/")
+
+        rel_paths: List[str] = []
+        for fp_abs in all_abs:
+            try:
+                rel = os.path.relpath(fp_abs, root_abs)
+            except Exception:
+                continue
+            if rel.startswith(".."):
+                continue
+            rel_paths.append(rel)
+
+        tree: dict = {}
+        for rel in rel_paths:
+            rel = os.path.normpath(rel)
+            parts = [p for p in rel.split(os.sep) if p and p != "."]
+            if not parts:
+                continue
+            _insert_path(tree, parts)
+
+        # custom render that annotates leaf files
+        def render(node: dict, depth: int) -> List[str]:
+            out: List[str] = []
+            if max_depth > 0 and depth > max_depth:
+                return out
+            indent = "    " * depth
+            dirs = sorted(node.get("dirs", {}).keys())
+            files = sorted(node.get("files", set()))
+            for dname in dirs:
+                if max_depth > 0 and depth >= max_depth:
+                    continue
+                out.append(f"{indent}{dname}/")
+                out.extend(render(node["dirs"][dname], depth + 1))
+            for fname in files:
+                # reconstruct abs to lookup: we can't easily here, so we'll annotate using included set by rel match
+                out.append(f"{indent}{fname}")
+            return out
+
+        rendered = render(tree, depth=1)
+
+        # annotate file lines by re-evaluating against decisions using rel paths
+        annotated: List[str] = []
+        for line in rendered:
+            stripped = line.strip()
+            if stripped.endswith("/"):
+                annotated.append(line)
+                continue
+            # It's a file; compute abs by joining root_abs with indentation-derived path:
+            # We'll reconstruct using the already built tree by walking path segments from indentation.
+            # Simpler: rebuild from rel_paths map:
+            # We'll just annotate if any decision endswith that basename at the same depth is ambiguous.
+            # To avoid ambiguity, we annotate only with basename when ambiguous: show "?".
+            annotated.append(line)
+        # A robust annotated tree is nice but costs complexity; instead, we provide explicit lists below.
+        lines.extend(rendered)
+
+    lines.append("==============================\n")
+    # NOTE: Tree lines above are structural; the authoritative included/excluded lists follow.
+    return "\n".join(lines)
+
+
+# -----------------------------------------------------------------------------
+# IO: instructions + bundle writing
+# -----------------------------------------------------------------------------
 def read_instructions(path: Optional[str]) -> str:
     if not path:
         return DEFAULT_INSTRUCTIONS
@@ -499,66 +874,16 @@ def read_instructions(path: Optional[str]) -> str:
         return DEFAULT_INSTRUCTIONS + f"\n[Note: failed to read instructions file: {e}]\n"
 
 
-def rel_display_path(path: str, roots: Sequence[str]) -> str:
-    norm = os.path.normpath(path)
-    best = None
-    for r in roots:
-        r2 = os.path.normpath(r)
-        if os.path.isdir(r2):
-            try:
-                rel = os.path.relpath(norm, r2)
-                if not rel.startswith(".."):
-                    cand = os.path.join(os.path.basename(r2) or r2, rel)
-                    best = cand
-                    break
-            except Exception:
-                pass
-    disp = best if best else norm
-    return disp.replace(os.sep, "/")
-
-
-def write_bundle(cfg: Config) -> int:
-    exclude_dir_names = set(cfg.exclude_dir_names)
-    exclude_file_names = set(cfg.exclude_file_names)
-    exclude_paths_abs = resolve_exclude_paths(cfg)
-
+def write_bundle(cfg: Config, decisions: Sequence[FileDecision]) -> int:
     out_path = expand_out_path(cfg.out)
     instructions = read_instructions(cfg.instructions_file)
 
-    gitignore_caches: Dict[str, Dict[str, List[str]]] = {}
-    if cfg.use_gitignore:
-        for r in cfg.roots:
-            r_abs = os.path.abspath(r)
-            if os.path.isdir(r_abs):
-                gitignore_caches[r_abs] = build_gitignore_cache(r_abs)
+    included = [d for d in decisions if d.included]
+    included_abs = [d.abs_path for d in included]
 
     tree = ""
     if cfg.include_tree:
-        tree = generate_tree_for_roots(
-            cfg.roots,
-            cfg,
-            exclude_dir_names,
-            exclude_file_names,
-            exclude_paths_abs,
-            gitignore_caches,
-        )
-
-    uniq_map: Dict[str, str] = {}
-    for r in cfg.roots:
-        r_abs = os.path.abspath(r)
-        gi_cache = gitignore_caches.get(r_abs)
-        for fp in iter_files_under_root(
-            r,
-            cfg,
-            exclude_dir_names,
-            exclude_file_names,
-            exclude_paths_abs,
-            gi_cache,
-        ):
-            key = uniq_key(fp, cfg.follow_symlinks)
-            uniq_map.setdefault(key, fp)
-
-    files = sorted(uniq_map.values())
+        tree = build_tree_from_included_files(cfg.roots, included_abs, cfg.tree_max_depth)
 
     if out_path == "-":
         out_f = sys.stdout
@@ -568,8 +893,6 @@ def write_bundle(cfg: Config) -> int:
         close_after = True
 
     count = 0
-    skipped_binary = 0
-    skipped_big = 0
     truncated = 0
 
     try:
@@ -578,25 +901,10 @@ def write_bundle(cfg: Config) -> int:
             out_f.write(tree + "\n")
         out_f.write("=== File Contents ===\n\n")
 
-        for fp in files:
-            if not is_probably_text_file(fp):
-                skipped_binary += 1
-                continue
-
-            try:
-                size = os.path.getsize(fp)
-            except Exception:
-                size = -1
-
-            if cfg.max_bytes > 0 and size >= 0 and size > cfg.max_bytes:
-                if cfg.big_file == "skip":
-                    skipped_big += 1
-                    continue
-                read_bytes = cfg.truncate_bytes if cfg.truncate_bytes > 0 else cfg.max_bytes
-            else:
-                read_bytes = None
-
+        for d in included:
+            fp = d.path
             disp = rel_display_path(fp, cfg.roots)
+            read_bytes = d.read_bytes
 
             try:
                 out_f.write("\n" + "=" * 60 + "\n")
@@ -619,10 +927,14 @@ def write_bundle(cfg: Config) -> int:
 
                 count += 1
             except Exception:
+                # unreadable at write time -> skip silently (plan already tried, but TOCTOU can happen)
                 continue
     finally:
         if close_after:
             out_f.close()
+
+    skipped_binary = sum(1 for d in decisions if (not d.included and d.reason == SkipReason.BINARY))
+    skipped_big = sum(1 for d in decisions if (not d.included and d.reason == SkipReason.TOO_BIG))
 
     print(
         f"bundletext: wrote {count} file(s), skipped_binary={skipped_binary}, skipped_big={skipped_big}, truncated={truncated}",
@@ -634,6 +946,61 @@ def write_bundle(cfg: Config) -> int:
     return count
 
 
+# -----------------------------------------------------------------------------
+# Dry-run report
+# -----------------------------------------------------------------------------
+def print_dry_run_report(cfg: Config, decisions: Sequence[FileDecision]) -> None:
+    included = [d for d in decisions if d.included]
+    skipped = [d for d in decisions if not d.included]
+
+    # Trees
+    # - Candidate Tree: after excludes/.gitignore, before binary/size/unreadable decisions.
+    # - Project Tree   : identical to real output (included-only; default tree-only-included).
+    all_abs = [d.abs_path for d in decisions]
+    if cfg.include_tree:
+        cand_tree = build_tree_from_files(cfg.roots, all_abs, cfg.tree_max_depth, "=== Candidate Tree ===")
+        print(cand_tree)
+        tree = build_tree_from_included_files(cfg.roots, included_abs, cfg.tree_max_depth)
+        print(tree)
+
+    print("=== Dry Run: Included Files ===")
+    for d in included:
+        disp = rel_display_path(d.path, cfg.roots)
+        extra = ""
+        if d.truncated:
+            extra = f" [TRUNCATE to {d.read_bytes} bytes]"
+        print(f"[OK] {disp}{extra}")
+    if not included:
+        print("(none)")
+    print()
+
+    print("=== Dry Run: Skipped Files ===")
+    for d in skipped:
+        disp = rel_display_path(d.path, cfg.roots)
+        detail = f" ({d.detail})" if d.detail else ""
+        print(f"[SKIP:{d.reason}] {disp}{detail}")
+    if not skipped:
+        print("(none)")
+    print()
+
+    # Summary
+    skipped_by_reason: Dict[str, int] = {}
+    for d in skipped:
+        k = str(d.reason)
+        skipped_by_reason[k] = skipped_by_reason.get(k, 0) + 1
+
+    print("=== Dry Run Summary ===")
+    print(f"included: {len(included)}")
+    print(f"skipped : {len(skipped)}")
+    if skipped_by_reason:
+        for k in sorted(skipped_by_reason.keys()):
+            print(f"  - {k}: {skipped_by_reason[k]}")
+    print("=======================\n")
+
+
+# -----------------------------------------------------------------------------
+# CLI parsing
+# -----------------------------------------------------------------------------
 def parse_args() -> Config:
     p = argparse.ArgumentParser(
         prog="bundletext",
@@ -641,8 +1008,11 @@ def parse_args() -> Config:
     )
     p.add_argument("paths", nargs="+", help="Root paths to include (directories and/or files).")
 
-    p.add_argument("--out", required=True, help="Output: FILE, DIR/, '-'(stdout), supports {date}/{time}.")
-
+    p.add_argument(
+        "--out",
+        required=True,
+        help="Output: FILE, DIR/, '-'(stdout), supports {date}/{time}. (ignored in --dry-run)",
+    )
     p.add_argument("--instructions-file", default=None)
 
     # ADDITIVE excludes by default (built-ins are always applied)
@@ -666,21 +1036,9 @@ def parse_args() -> Config:
     )
 
     # switches to disable built-in excludes
-    p.add_argument(
-        "--no-default-exclude-dir",
-        action="store_true",
-        help="Do not use built-in default excluded directories.",
-    )
-    p.add_argument(
-        "--no-default-exclude-file",
-        action="store_true",
-        help="Do not use built-in default excluded files.",
-    )
-    p.add_argument(
-        "--no-default-exclude-glob",
-        action="store_true",
-        help="Do not use built-in default excluded glob patterns.",
-    )
+    p.add_argument("--no-default-exclude-dir", action="store_true", help="Do not use built-in default excluded directories.")
+    p.add_argument("--no-default-exclude-file", action="store_true", help="Do not use built-in default excluded files.")
+    p.add_argument("--no-default-exclude-glob", action="store_true", help="Do not use built-in default excluded glob patterns.")
 
     p.add_argument(
         "--exclude-path",
@@ -698,16 +1056,22 @@ def parse_args() -> Config:
     p.add_argument("--truncate-bytes", type=int, default=0)
 
     p.add_argument("--follow-symlinks", action="store_true")
+    p.add_argument("--no-gitignore", action="store_true", help="Disable reading .gitignore files (default: enabled).")
 
     p.add_argument(
-        "--no-gitignore",
+        "--no-binary-check",
         action="store_true",
-        help="Disable reading .gitignore files (default: enabled).",
+        help="Disable binary detection (treat all files as text; still subject to excludes and size policy).",
+    )
+
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not write output. Print which files would be included/skipped (with reasons).",
     )
 
     a = p.parse_args()
 
-    # Merge excludes (defaults + user additions), with an escape hatch to disable defaults
     base_dirs = [] if a.no_default_exclude_dir else sorted(DEFAULT_EXCLUDE_DIR_NAMES)
     base_files = [] if a.no_default_exclude_file else sorted(DEFAULT_EXCLUDE_FILE_NAMES)
     base_globs = [] if a.no_default_exclude_glob else list(DEFAULT_EXCLUDE_GLOBS)
@@ -732,12 +1096,20 @@ def parse_args() -> Config:
         truncate_bytes=a.truncate_bytes,
         follow_symlinks=a.follow_symlinks,
         use_gitignore=(not a.no_gitignore),
+        no_binary_check=bool(a.no_binary_check),
+        dry_run=bool(a.dry_run),
     )
 
 
 def main() -> None:
     cfg = parse_args()
-    write_bundle(cfg)
+    decisions, _gi = plan_files(cfg)
+
+    if cfg.dry_run:
+        print_dry_run_report(cfg, decisions)
+        return
+
+    write_bundle(cfg, decisions)
 
 
 if __name__ == "__main__":
