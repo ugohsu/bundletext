@@ -52,7 +52,7 @@ LLM を使った作業では、次のような情報を **まとめて渡した�
 リポジトリをクローンし、`bundletext` を PATH の通った場所に置いてください。
 
 ```bash
-git clone https://github.com/yourname/bundletext.git
+git clone https://github.com/ugohsu/bundletext.git
 cd bundletext
 chmod +x bundletext
 sudo mv bundletext /usr/local/bin/
