@@ -1,0 +1,689 @@
+#!/usr/bin/env python3
+"""
+bundletext: Bundle (mostly) all non-binary files under given paths into one text file for LLM ingestion.
+
+New:
+- Respects .gitignore by default (basic support; can be disabled with --no-gitignore)
+- Supports wildcard exclusions via --exclude-glob (fnmatch-style globs)
+- Supports excluding specific paths via --exclude-path
+
+Examples:
+  bundletext . --out bundle_{date}_{time}.txt
+  bundletext . --exclude-glob "*.db" "*.csv" --out bundle.txt
+  bundletext . --exclude-path "data/secret.txt" "tmp/" --out bundle.txt
+  bundletext . --no-gitignore --out bundle.txt
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import datetime
+import fnmatch
+from dataclasses import dataclass
+from typing import Iterable, Sequence, Set, Tuple, Optional, Dict, List
+
+
+# --- defaults ---
+DEFAULT_EXCLUDE_DIR_NAMES: Set[str] = {
+    ".git",
+    "__pycache__",
+    ".ipynb_checkpoints",
+    "node_modules",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".idea",
+    ".vscode",
+    "coverage",
+    "img",
+    "images",
+}
+
+DEFAULT_EXCLUDE_FILE_NAMES: Set[str] = {
+    ".DS_Store",
+    "Thumbs.db",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+}
+
+# "By default, bundle non-binary files", but it’s still useful to exclude large/binary-ish datasets by default.
+# You can override/clear by passing --exclude-glob with your own list (or --exclude-glob "" if you want none).
+DEFAULT_EXCLUDE_GLOBS: Tuple[str, ...] = (
+    "*.db",
+    "*.sqlite",
+    "*.sqlite3",
+    "*.csv",
+    "*.tsv",
+    "*.parquet",
+    "*.feather",
+    "*.pkl",
+    "*.pickle",
+    "*.npz",
+    "*.npy",
+    "*.zip",
+    "*.gz",
+    "*.bz2",
+    "*.7z",
+    "*.pdf",
+    "*.png",
+    "*.jpg",
+    "*.jpeg",
+    "*.webp",
+    "*.gif",
+    "*.mp4",
+    "*.mov",
+    "*.avi",
+    "*.wav",
+    "*.mp3",
+    "*.flac",
+)
+
+DEFAULT_INSTRUCTIONS = """\
+=== AI INSTRUCTIONS (Generic) ===
+You are given:
+1) Project Tree: for understanding structure.
+2) File Contents: each file begins with FILE_PATH.
+
+Guidelines:
+- Prefer docs/README for overview; rely on code for exact behavior.
+- If docs and code disagree, treat code as source of truth.
+- When proposing changes, reference FILE_PATH and relevant snippets.
+===============================
+"""
+
+
+@dataclass(frozen=True)
+class Config:
+    roots: Tuple[str, ...]
+    out: str
+    instructions_file: Optional[str]
+
+    exclude_dir_names: Tuple[str, ...]
+    exclude_file_names: Tuple[str, ...]
+    exclude_path_substr: Tuple[str, ...]
+    exclude_globs: Tuple[str, ...]
+    exclude_paths: Tuple[str, ...]  # explicit paths (relative or absolute)
+
+    tree_max_depth: int  # 0 = unlimited
+    include_tree: bool
+
+    max_bytes: int  # 0 = unlimited
+    big_file: str  # "skip" or "truncate"
+    truncate_bytes: int
+    follow_symlinks: bool
+
+    use_gitignore: bool
+
+
+def now_tokens() -> tuple[str, str]:
+    dt = datetime.datetime.now()
+    return dt.strftime("%Y%m%d"), dt.strftime("%H%M%S")
+
+
+def expand_out_path(out: str) -> str:
+    if out == "-":
+        return out
+    date_s, time_s = now_tokens()
+    out2 = out.replace("{date}", date_s).replace("{time}", time_s)
+
+    if out2.endswith(os.sep) or (os.path.exists(out2) and os.path.isdir(out2)):
+        out_dir = out2[:-1] if out2.endswith(os.sep) else out2
+        os.makedirs(out_dir, exist_ok=True)
+        filename = f"bundletext_{date_s}_{time_s}.txt"
+        return os.path.join(out_dir, filename)
+
+    parent = os.path.dirname(out2)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return out2
+
+
+def norm_slash(p: str) -> str:
+    return os.path.normpath(p).replace(os.sep, "/")
+
+
+def should_skip_by_substr(path: str, exclude_substrs: Sequence[str]) -> bool:
+    norm = norm_slash(path)
+    return any(s and s in norm for s in exclude_substrs)
+
+
+def matches_any_glob(path: str, globs: Sequence[str]) -> bool:
+    """
+    Match against:
+      - basename globs: *.db
+      - path globs: **/data/**  (basic fnmatch, using normalized "/" path)
+    """
+    if not globs:
+        return False
+    p = norm_slash(path)
+    base = os.path.basename(path)
+    for g in globs:
+        if not g:
+            continue
+        # Try both basename and full path.
+        if fnmatch.fnmatch(base, g) or fnmatch.fnmatch(p, g):
+            return True
+    return False
+
+
+def resolve_exclude_paths(cfg: Config) -> Set[str]:
+    """
+    Normalize explicit exclude paths to absolute normalized paths
+    so it works reliably regardless of cwd.
+    """
+    out: Set[str] = set()
+    for raw in cfg.exclude_paths:
+        if not raw:
+            continue
+        # If relative, resolve relative to current working directory
+        abs_p = os.path.abspath(raw)
+        out.add(os.path.normpath(abs_p))
+    return out
+
+
+def is_probably_text_file(path: str, sample_size: int = 4096) -> bool:
+    try:
+        with open(path, "rb") as f:
+            sample = f.read(sample_size)
+    except Exception:
+        return False
+
+    if b"\x00" in sample:
+        return False
+    if not sample:
+        return True
+
+    printable = 0
+    for b in sample:
+        if b in (9, 10, 13) or 32 <= b <= 126:
+            printable += 1
+    ratio = printable / max(len(sample), 1)
+    return ratio >= 0.60
+
+
+# -------------------------
+# Basic .gitignore support
+# -------------------------
+def read_gitignore_lines(gitignore_path: str) -> List[str]:
+    try:
+        with open(gitignore_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = []
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                # NOTE: "!" negation not implemented in this basic version.
+                if s.startswith("!"):
+                    # ignore negation lines for now
+                    continue
+                lines.append(s)
+            return lines
+    except Exception:
+        return []
+
+
+def gitignore_match(rel_path: str, patterns: Sequence[str]) -> bool:
+    """
+    Very small subset:
+    - "foo/" matches directory prefix
+    - "foo" matches file/dir name or path segment via fnmatch
+    - patterns can contain globs
+    - leading "/" anchors to root
+    """
+    p = rel_path.lstrip("./")
+    p = p.replace("\\", "/")
+    base = os.path.basename(p)
+
+    for pat in patterns:
+        anchored = pat.startswith("/")
+        pat2 = pat[1:] if anchored else pat
+
+        # directory pattern
+        if pat2.endswith("/"):
+            d = pat2[:-1]
+            if anchored:
+                if p == d or p.startswith(d + "/"):
+                    return True
+            else:
+                # match any segment prefix
+                if ("/" + d + "/") in ("/" + p + "/") or p.startswith(d + "/"):
+                    return True
+            continue
+
+        # file/path pattern
+        if anchored:
+            if fnmatch.fnmatch(p, pat2):
+                return True
+        else:
+            # match either basename or anywhere in path
+            if fnmatch.fnmatch(base, pat2) or fnmatch.fnmatch(p, f"**/{pat2}") or fnmatch.fnmatch(p, pat2):
+                return True
+
+    return False
+
+
+def build_gitignore_cache(root_dir: str) -> Dict[str, List[str]]:
+    """
+    Map directory absolute path -> aggregated patterns applying to that directory.
+    Aggregation rule:
+      patterns(dir) = patterns(parent) + lines(dir/.gitignore)
+    """
+    cache: Dict[str, List[str]] = {}
+
+    root_dir = os.path.abspath(root_dir)
+    cache[root_dir] = []
+
+    for cur, subdirs, _files in os.walk(root_dir):
+        cur_abs = os.path.abspath(cur)
+        if cur_abs not in cache:
+            parent = os.path.dirname(cur_abs)
+            cache[cur_abs] = list(cache.get(parent, []))
+
+        gi = os.path.join(cur_abs, ".gitignore")
+        if os.path.exists(gi) and os.path.isfile(gi):
+            cache[cur_abs].extend(read_gitignore_lines(gi))
+
+        # ensure children will inherit (pre-seed)
+        for d in subdirs:
+            child = os.path.abspath(os.path.join(cur_abs, d))
+            if child not in cache:
+                cache[child] = list(cache[cur_abs])
+
+    return cache
+
+
+def is_ignored_by_gitignore(
+    path_abs: str,
+    root_dir_abs: str,
+    gitignore_cache: Dict[str, List[str]],
+) -> bool:
+    """
+    Decide based on the patterns aggregated for the directory containing the path.
+    """
+    dir_abs = os.path.dirname(path_abs)
+    patterns = gitignore_cache.get(dir_abs, [])
+    if not patterns:
+        return False
+
+    rel = os.path.relpath(path_abs, root_dir_abs).replace(os.sep, "/")
+    return gitignore_match(rel, patterns)
+
+
+# -------------------------
+# Walking / tree / bundling
+# -------------------------
+def iter_files_under_root(
+    root: str,
+    cfg: Config,
+    exclude_dir_names: Set[str],
+    exclude_file_names: Set[str],
+    exclude_paths_abs: Set[str],
+    gitignore_cache: Optional[Dict[str, List[str]]],
+) -> Iterable[str]:
+    root = os.path.normpath(root)
+    if not os.path.exists(root):
+        return
+
+    if os.path.isfile(root):
+        if os.path.basename(root) in exclude_file_names:
+            return
+        abs_p = os.path.abspath(root)
+        if abs_p in exclude_paths_abs:
+            return
+        if should_skip_by_substr(abs_p, cfg.exclude_path_substr):
+            return
+        if matches_any_glob(abs_p, cfg.exclude_globs):
+            return
+        if cfg.use_gitignore and gitignore_cache and os.path.isdir(os.path.dirname(abs_p)):
+            # root file belongs to some dir; only apply if root is under its dir root (handled elsewhere)
+            pass
+        yield root
+        return
+
+    root_abs = os.path.abspath(root)
+
+    for cur, subdirs, files in os.walk(root, followlinks=cfg.follow_symlinks):
+        cur_abs = os.path.abspath(cur)
+
+        # depth limiting relative to this root
+        if cfg.tree_max_depth > 0:
+            rel = os.path.relpath(cur, root)
+            depth = 0 if rel == "." else rel.count(os.sep) + 1
+            if depth > cfg.tree_max_depth:
+                subdirs[:] = []
+                continue
+
+        # exclude dirs by name
+        subdirs[:] = [d for d in subdirs if d not in exclude_dir_names]
+
+        # skip subtree by substring/glob/explicit path
+        if should_skip_by_substr(cur_abs, cfg.exclude_path_substr):
+            subdirs[:] = []
+            continue
+        if matches_any_glob(cur_abs, cfg.exclude_globs):
+            subdirs[:] = []
+            continue
+        if cur_abs in exclude_paths_abs:
+            subdirs[:] = []
+            continue
+
+        for fn in files:
+            if fn in exclude_file_names:
+                continue
+            full = os.path.join(cur, fn)
+            full_abs = os.path.abspath(full)
+
+            if full_abs in exclude_paths_abs:
+                continue
+            if should_skip_by_substr(full_abs, cfg.exclude_path_substr):
+                continue
+            if matches_any_glob(full_abs, cfg.exclude_globs):
+                continue
+
+            if cfg.use_gitignore and gitignore_cache:
+                if is_ignored_by_gitignore(full_abs, root_abs, gitignore_cache):
+                    continue
+
+            yield full
+
+
+def generate_tree_for_roots(
+    roots: Sequence[str],
+    cfg: Config,
+    exclude_dir_names: Set[str],
+    exclude_file_names: Set[str],
+    exclude_paths_abs: Set[str],
+    gitignore_caches: Dict[str, Dict[str, List[str]]],
+) -> str:
+    lines = ["=== Project Tree ==="]
+
+    for root in roots:
+        root = os.path.normpath(root)
+        if not os.path.exists(root):
+            continue
+
+        if os.path.isfile(root):
+            lines.append(os.path.basename(root))
+            continue
+
+        root_abs = os.path.abspath(root)
+        lines.append(f"{os.path.basename(root) or root}/")
+
+        gi_cache = gitignore_caches.get(root_abs)
+
+        for cur, subdirs, files in os.walk(root, followlinks=cfg.follow_symlinks):
+            cur_abs = os.path.abspath(cur)
+
+            rel = os.path.relpath(cur, root)
+            depth = 0 if rel == "." else rel.count(os.sep) + 1
+            if cfg.tree_max_depth > 0 and depth > cfg.tree_max_depth:
+                subdirs[:] = []
+                continue
+
+            subdirs[:] = [d for d in subdirs if d not in exclude_dir_names]
+
+            if should_skip_by_substr(cur_abs, cfg.exclude_path_substr):
+                subdirs[:] = []
+                continue
+            if matches_any_glob(cur_abs, cfg.exclude_globs):
+                subdirs[:] = []
+                continue
+            if cur_abs in exclude_paths_abs:
+                subdirs[:] = []
+                continue
+
+            indent = "    " * depth
+            if rel != ".":
+                lines.append(f"{indent}{os.path.basename(cur)}/")
+
+            sub_indent = "    " * (depth + 1)
+            for fn in sorted(files):
+                if fn in exclude_file_names:
+                    continue
+                full = os.path.join(cur, fn)
+                full_abs = os.path.abspath(full)
+
+                if full_abs in exclude_paths_abs:
+                    continue
+                if should_skip_by_substr(full_abs, cfg.exclude_path_substr):
+                    continue
+                if matches_any_glob(full_abs, cfg.exclude_globs):
+                    continue
+                if cfg.use_gitignore and gi_cache:
+                    if is_ignored_by_gitignore(full_abs, root_abs, gi_cache):
+                        continue
+
+                lines.append(f"{sub_indent}{fn}")
+
+    lines.append("====================\n")
+    return "\n".join(lines)
+
+
+def read_instructions(path: Optional[str]) -> str:
+    if not path:
+        return DEFAULT_INSTRUCTIONS
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().rstrip() + "\n"
+    except Exception as e:
+        return DEFAULT_INSTRUCTIONS + f"\n[Note: failed to read instructions file: {e}]\n"
+
+
+def rel_display_path(path: str, roots: Sequence[str]) -> str:
+    norm = os.path.normpath(path)
+    best = None
+    for r in roots:
+        r2 = os.path.normpath(r)
+        if os.path.isdir(r2):
+            try:
+                rel = os.path.relpath(norm, r2)
+                if not rel.startswith(".."):
+                    cand = os.path.join(os.path.basename(r2) or r2, rel)
+                    best = cand
+                    break
+            except Exception:
+                pass
+    disp = best if best else norm
+    return disp.replace(os.sep, "/")
+
+
+def write_bundle(cfg: Config) -> int:
+    exclude_dir_names = set(cfg.exclude_dir_names)
+    exclude_file_names = set(cfg.exclude_file_names)
+    exclude_paths_abs = resolve_exclude_paths(cfg)
+
+    out_path = expand_out_path(cfg.out)
+    instructions = read_instructions(cfg.instructions_file)
+
+    # build gitignore caches per root dir (only for directory roots)
+    gitignore_caches: Dict[str, Dict[str, List[str]]] = {}
+    if cfg.use_gitignore:
+        for r in cfg.roots:
+            r_abs = os.path.abspath(r)
+            if os.path.isdir(r_abs):
+                gitignore_caches[r_abs] = build_gitignore_cache(r_abs)
+
+    tree = ""
+    if cfg.include_tree:
+        tree = generate_tree_for_roots(
+            cfg.roots,
+            cfg,
+            exclude_dir_names,
+            exclude_file_names,
+            exclude_paths_abs,
+            gitignore_caches,
+        )
+
+    files: List[str] = []
+    for r in cfg.roots:
+        r_abs = os.path.abspath(r)
+        gi_cache = gitignore_caches.get(r_abs)
+        for fp in iter_files_under_root(
+            r,
+            cfg,
+            exclude_dir_names,
+            exclude_file_names,
+            exclude_paths_abs,
+            gi_cache,
+        ):
+            files.append(fp)
+
+    files = sorted(set(files))
+
+    if out_path == "-":
+        out_f = sys.stdout
+        close_after = False
+    else:
+        out_f = open(out_path, "w", encoding="utf-8")
+        close_after = True
+
+    count = 0
+    skipped_binary = 0
+    skipped_big = 0
+    truncated = 0
+
+    try:
+        out_f.write(instructions + "\n")
+        if tree:
+            out_f.write(tree + "\n")
+        out_f.write("=== File Contents ===\n\n")
+
+        for fp in files:
+            # skip binary-ish
+            if not is_probably_text_file(fp):
+                skipped_binary += 1
+                continue
+
+            # size control
+            try:
+                size = os.path.getsize(fp)
+            except Exception:
+                size = -1
+
+            if cfg.max_bytes > 0 and size >= 0 and size > cfg.max_bytes:
+                if cfg.big_file == "skip":
+                    skipped_big += 1
+                    continue
+                read_bytes = cfg.truncate_bytes if cfg.truncate_bytes > 0 else cfg.max_bytes
+            else:
+                read_bytes = None
+
+            disp = rel_display_path(fp, cfg.roots)
+
+            try:
+                out_f.write("\n" + "=" * 60 + "\n")
+                out_f.write(f"FILE_PATH: {disp}\n")
+                out_f.write("=" * 60 + "\n")
+
+                if read_bytes is None:
+                    with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                else:
+                    with open(fp, "rb") as f:
+                        b = f.read(read_bytes)
+                    content = b.decode("utf-8", errors="replace")
+                    content += "\n\n[TRUNCATED]\n"
+                    truncated += 1
+
+                out_f.write(content)
+                if not content.endswith("\n"):
+                    out_f.write("\n")
+
+                count += 1
+            except Exception:
+                continue
+    finally:
+        if close_after:
+            out_f.close()
+
+    print(
+        f"bundletext: wrote {count} file(s), skipped_binary={skipped_binary}, skipped_big={skipped_big}, truncated={truncated}",
+        file=sys.stderr,
+    )
+    if out_path != "-":
+        print(f"bundletext: output={out_path}", file=sys.stderr)
+
+    return count
+
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        prog="bundletext",
+        description="Bundle (mostly) all non-binary files under given paths into one text file.",
+    )
+    p.add_argument("paths", nargs="+", help="Root paths to include (directories and/or files).")
+
+    p.add_argument("--out", required=True, help="Output: FILE, DIR/, '-'(stdout), supports {date}/{time}.")
+
+    p.add_argument("--instructions-file", default=None)
+
+    p.add_argument("--exclude-dir", nargs="*", default=sorted(DEFAULT_EXCLUDE_DIR_NAMES))
+    p.add_argument("--exclude-file", nargs="*", default=sorted(DEFAULT_EXCLUDE_FILE_NAMES))
+
+    p.add_argument(
+        "--exclude-glob",
+        nargs="*",
+        default=list(DEFAULT_EXCLUDE_GLOBS),
+        help='Glob patterns to exclude, e.g. "*.db" "**/data/**". Matched against basename and full path.',
+    )
+
+    p.add_argument(
+        "--exclude-path",
+        nargs="*",
+        default=[],
+        help='Explicit paths to exclude (relative or absolute). e.g. "data/secret.txt" "tmp/".',
+    )
+
+    p.add_argument("--exclude-path-substr", nargs="*", default=[])
+
+    p.add_argument("--tree-max-depth", type=int, default=0)
+    p.add_argument("--no-tree", action="store_true")
+
+    p.add_argument("--max-bytes", type=int, default=0)
+    p.add_argument("--big-file", choices=["skip", "truncate"], default="skip")
+    p.add_argument("--truncate-bytes", type=int, default=0)
+
+    p.add_argument("--follow-symlinks", action="store_true")
+
+    p.add_argument(
+        "--no-gitignore",
+        action="store_true",
+        help="Disable reading .gitignore files (default: enabled).",
+    )
+
+    a = p.parse_args()
+
+    return Config(
+        roots=tuple(a.paths),
+        out=a.out,
+        instructions_file=a.instructions_file,
+        exclude_dir_names=tuple(a.exclude_dir),
+        exclude_file_names=tuple(a.exclude_file),
+        exclude_path_substr=tuple(a.exclude_path_substr),
+        exclude_globs=tuple(a.exclude_glob),
+        exclude_paths=tuple(a.exclude_path),
+        tree_max_depth=a.tree_max_depth,
+        include_tree=(not a.no_tree),
+        max_bytes=a.max_bytes,
+        big_file=a.big_file,
+        truncate_bytes=a.truncate_bytes,
+        follow_symlinks=a.follow_symlinks,
+        use_gitignore=(not a.no_gitignore),
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    write_bundle(cfg)
+
+
+if __name__ == "__main__":
+    main()
