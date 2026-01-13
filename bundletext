@@ -815,7 +815,7 @@ def write_bundle(cfg: Config, decisions: Sequence[FileDecision]) -> int:
             read_bytes = d.read_bytes
 
             try:
-                out_f.write(f"<<<FILE: {disp}>>>\n")
+                out_f.write(f"\n<<<FILE: {disp}>>>\n")
 
                 if read_bytes is None:
                     with open(fp, "r", encoding="utf-8", errors="replace") as f:
