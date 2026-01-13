@@ -14,23 +14,25 @@
 
 - 📦 非バイナリファイルを自動収集して 1 つのテキストにまとめる
 - 🌳 実際に bundle に含まれるファイルだけで **Project Tree を生成（デフォルト）**
+- 🤖 **LLM に最適化されたトークン節約フォーマット (`<<<FILE: path>>>`)**
 - 🙈 `.gitignore` を尊重した自然な除外
 - 🧹 多様な除外指定（名前 / glob / パス / 明示指定）
 - 📏 ファイルサイズ制御（スキップ / 先頭のみ取り込み）
 - 🔗 シンボリックリンク対応（循環自動回避）
 - 🧪 dry-run による **事前確認（入る / 入らない理由つき）**
 - 🔁 再現性のある安定した出力順
-- 🔌 標準出力対応（パイプ利用）
+- 🔌 標準出力対応（パイプ利用・デフォルト）
 
 ---
 
 ## インストール
 
 ```bash
-git clone https://github.com/ugohsu/bundletext.git
+git clone [https://github.com/ugohsu/bundletext.git](https://github.com/ugohsu/bundletext.git)
 cd bundletext
 chmod +x bundletext
 sudo mv bundletext /usr/local/bin/
+
 ```
 
 ※ `~/bin` など PATH が通った場所でも可
@@ -42,31 +44,40 @@ sudo mv bundletext /usr/local/bin/
 ### カレントディレクトリ以下をまとめる
 
 ```bash
-bundletext . --out bundle.txt
+# 標準出力へ表示（デフォルト）
+bundletext .
+
+# ファイルへ保存
+bundletext . -o bundle.txt
+
 ```
 
 ### 複数パスを指定
 
 ```bash
-bundletext src docs README.md --out bundle.txt
+bundletext src docs README.md -o bundle.txt
+
 ```
 
 ---
 
-## 出力先（`--out`）
+## 出力先（`--out` / `-o`）
+
+出力オプションを省略すると **標準出力** に書き出されます。
 
 ```bash
-# ファイルに書き出す
-bundletext . --out bundle.txt
+# 標準出力（パイプ利用）
+bundletext . | less
+
+# ファイルに書き出す（-o は --out の短縮形）
+bundletext . -o bundle.txt
 
 # ディレクトリ指定（自動命名）
-bundletext . --out ./bundles/
-
-# 標準出力（パイプ利用）
-bundletext . --out - | less
+bundletext . -o ./bundles/
 
 # プレースホルダ
-bundletext . --out bundle_{date}_{time}.txt
+bundletext . -o bundle_{date}_{time}.txt
+
 ```
 
 ---
@@ -77,19 +88,21 @@ bundletext . --out bundle_{date}_{time}.txt
 以下の情報を表示します。
 
 * Candidate Tree
-  （除外適用後・binary/size 判定前の候補）
+（除外適用後・binary/size 判定前の候補）
 * Included Project Tree
-  （実際に bundle に入るファイルのみ）
+（実際に bundle に入るファイルのみ）
 * Included Files（truncate 情報つき）
 * Skipped Files（理由つき）
+    * binary
+    * too_big
+    * unreadable
 
-  * binary
-  * too_big
-  * unreadable
+
 * Summary（理由別件数）
 
 ```bash
-bundletext . --dry-run --out -
+bundletext . --dry-run
+
 ```
 
 👉
@@ -113,7 +126,8 @@ Project Tree には、
 ツリーを無効化する場合：
 
 ```bash
-bundletext . --no-tree --out bundle.txt
+bundletext . --no-tree -o bundle.txt
+
 ```
 
 ---
@@ -124,7 +138,8 @@ bundletext . --no-tree --out bundle.txt
 Git に近い感覚でファイルを除外します。
 
 ```bash
-bundletext . --no-gitignore --out bundle.txt
+bundletext . --no-gitignore -o bundle.txt
+
 ```
 
 > ※ 否定パターン（`!`）は未対応
@@ -146,7 +161,8 @@ bundletext . --no-gitignore --out bundle.txt
 以下は **デフォルト除外に追加**されます。
 
 ```bash
-bundletext . --exclude-dir data logs --out bundle.txt
+bundletext . --exclude-dir data logs -o bundle.txt
+
 ```
 
 ### デフォルト除外を無効化したい場合
@@ -157,7 +173,8 @@ bundletext . \
   --no-default-exclude-file \
   --no-default-exclude-glob \
   --exclude-dir data \
-  --out bundle.txt
+  -o bundle.txt
+
 ```
 
 ---
@@ -168,7 +185,8 @@ bundletext . \
 bundletext . \
   --exclude-glob "*.db" "*.csv" "**/data/**" \
   --exclude-path /abs/path/to/secret.txt \
-  --out bundle.txt
+  -o bundle.txt
+
 ```
 
 ---
@@ -177,14 +195,15 @@ bundletext . \
 
 ```bash
 # サイズ超過はスキップ
-bundletext . --max-bytes 200000 --big-file skip --out bundle.txt
+bundletext . --max-bytes 200000 --big-file skip -o bundle.txt
 
 # サイズ超過は先頭だけ取り込む
 bundletext . \
   --max-bytes 200000 \
   --big-file truncate \
   --truncate-bytes 120000 \
-  --out bundle.txt
+  -o bundle.txt
+
 ```
 
 ---
@@ -202,7 +221,8 @@ bundletext . \
 ### 完全に無効化する場合
 
 ```bash
-bundletext . --no-binary-check --out bundle.txt
+bundletext . --no-binary-check -o bundle.txt
+
 ```
 
 ---
@@ -210,7 +230,8 @@ bundletext . --no-binary-check --out bundle.txt
 ## シンボリックリンク
 
 ```bash
-bundletext . --follow-symlinks --out bundle.txt
+bundletext . --follow-symlinks -o bundle.txt
+
 ```
 
 * ファイル / ディレクトリのリンクを辿ります
@@ -222,17 +243,21 @@ bundletext . --follow-symlinks --out bundle.txt
 ## 設計思想
 
 * **安全なデフォルト**
+    * 事故りにくさを最優先
 
-  * 事故りにくさを最優先
+
 * **可視性**
+    * dry-run による事前確認
 
-  * dry-run による事前確認
+
 * **再現性**
+    * 出力順・判定は常に安定
 
-  * 出力順・判定は常に安定
+
 * **LLM 非依存**
+    * 単なるテキスト生成ツール
 
-  * 単なるテキスト生成ツール
+
 
 「AI に渡す前の、最後の整形工程」を担うツールです。
 
