@@ -109,7 +109,7 @@ DEFAULT_INSTRUCTIONS = """\
 === AI INSTRUCTIONS (Generic) ===
 You are given:
 1) Project Tree: for understanding structure.
-2) File Contents: each file begins with FILE_PATH.
+2) File Contents: each file begins with <<<FILE: path>>>.
 
 Guidelines:
 - Use any high-level descriptions or comments (if present) to understand structure and intent.
@@ -815,9 +815,7 @@ def write_bundle(cfg: Config, decisions: Sequence[FileDecision]) -> int:
             read_bytes = d.read_bytes
 
             try:
-                out_f.write("\n" + "=" * 60 + "\n")
-                out_f.write(f"FILE_PATH: {disp}\n")
-                out_f.write("=" * 60 + "\n")
+                out_f.write(f"<<<FILE: {disp}>>>\n")
 
                 if read_bytes is None:
                     with open(fp, "r", encoding="utf-8", errors="replace") as f:
@@ -924,8 +922,9 @@ def parse_args() -> Config:
     p.add_argument("paths", nargs="+", help="Root paths to include (directories and/or files).")
 
     p.add_argument(
+        "-o",
         "--out",
-        required=True,
+        default="-",
         help="Output: FILE, DIR/, '-'(stdout), supports {date}/{time}. (ignored in --dry-run)",
     )
     p.add_argument("--instructions-file", default=None)
