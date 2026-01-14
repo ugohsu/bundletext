@@ -788,6 +788,11 @@ def write_bundle(cfg: Config, decisions: Sequence[FileDecision]) -> int:
     out_path = expand_out_path(cfg.out)
     instructions = read_instructions(cfg.instructions_file)
 
+    # Sync terminology: If we are using Flat List, update instructions to match the header.
+    if not cfg.visual_tree:
+        # "Project Tree" -> "Project File List"
+        instructions = instructions.replace("Project Tree", "Project File List")
+
     included = [d for d in decisions if d.included]
     included_abs = [d.abs_path for d in included]
 
