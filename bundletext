@@ -111,6 +111,7 @@ DEFAULT_INSTRUCTIONS = """\
 You are given:
 1) Project Tree: for understanding structure.
 2) File Contents: each file begins with <<<FILE: path>>> and ends with <<<END FILE>>>.
+
 Guidelines:
 - Use any high-level descriptions or comments (if present) to understand structure and intent.
 - Derive concrete behavior and details from the source files themselves.
