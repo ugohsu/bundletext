@@ -38,6 +38,7 @@ import argparse
 import datetime
 import fnmatch
 import os
+import signal
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -997,6 +998,12 @@ def parse_args() -> Config:
 
 
 def main() -> None:
+    # Handle broken pipes (e.g. when piping to `head` or `less`) explicitly
+    try:
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except AttributeError:
+        pass  # Windows usually doesn't have SIGPIPE
+
     cfg = parse_args()
     decisions, candidate_abs = plan_files(cfg)
 
