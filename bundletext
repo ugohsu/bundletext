@@ -116,7 +116,7 @@ Guidelines:
 - Use any high-level descriptions or comments (if present) to understand structure and intent.
 - Derive concrete behavior and details from the source files themselves.
 - When descriptions and implementation differ, treat the implementation as the source of truth.
-- When proposing changes, reference FILE_PATH and the relevant snippets.
+- When proposing changes, reference the file path and the relevant snippets.
 ===============================
 """
 
