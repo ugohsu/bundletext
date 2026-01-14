@@ -21,7 +21,7 @@ Features
   - Default behavior: Project Tree includes ONLY files actually bundled ("tree-only-included" default)
 - Dry-run:
   - --dry-run prints a report showing which files would be included vs skipped (with reasons).
-    It also prints:
+  - It also prints:
       * Candidate Tree: after excludes/.gitignore (before binary/size/readability checks)
       * Project Tree  : included-only (same as real output)
 
@@ -111,7 +111,6 @@ DEFAULT_INSTRUCTIONS = """\
 You are given:
 1) Project Tree: for understanding structure.
 2) File Contents: each file begins with <<<FILE: path>>> and ends with <<<END FILE>>>.
-
 Guidelines:
 - Use any high-level descriptions or comments (if present) to understand structure and intent.
 - Derive concrete behavior and details from the source files themselves.
@@ -144,6 +143,7 @@ class Config:
 
     tree_max_depth: int  # 0 = unlimited (also applies to traversal; kept for backward-compat)
     include_tree: bool
+    visual_tree: bool
 
     max_bytes: int  # 0 = unlimited
     big_file: str  # "skip" or "truncate"
@@ -257,7 +257,7 @@ def matches_any_glob(path: str, globs: Sequence[str]) -> bool:
     """
     Match against:
       - basename globs: *.db
-      - path globs: **/data/**  (basic fnmatch, using normalized "/" path)
+      - path globs: **/data/** (basic fnmatch, using normalized "/" path)
     """
     if not globs:
         return False
@@ -554,7 +554,8 @@ def decide_read_bytes_for_file(path: str, cfg: Config) -> Tuple[Optional[int], b
 
 def collect_candidates(cfg: Config) -> Tuple[List[Candidate], Dict[str, Dict[str, List[str]]]]:
     """
-    Collect candidates after excludes/.gitignore. Also performs global de-dup by uniq_key_for.
+    Collect candidates after excludes/.gitignore.
+    Also performs global de-dup by uniq_key_for.
 
     Returns:
       candidates: sorted by representative path (stable)
@@ -792,7 +793,13 @@ def write_bundle(cfg: Config, decisions: Sequence[FileDecision]) -> int:
 
     tree = ""
     if cfg.include_tree:
-        tree = build_tree_from_included_files(cfg.roots, included_abs, cfg.tree_max_depth)
+        if cfg.visual_tree:
+            tree = build_tree_from_included_files(cfg.roots, included_abs, cfg.tree_max_depth)
+        else:
+            lines = ["=== Project File List ==="]
+            lines.extend(rel_display_path(d.path, cfg.roots) for d in included)
+            lines.append("=========================\n")
+            tree = "\n".join(lines)
 
     if out_path == "-":
         out_f = sys.stdout
@@ -873,7 +880,13 @@ def print_dry_run_report(cfg: Config, decisions: Sequence[FileDecision], candida
         print(cand_tree)
 
         # Project Tree = included-only (same as real output)
-        tree = build_tree_from_included_files(cfg.roots, included_abs, cfg.tree_max_depth)
+        if cfg.visual_tree:
+            tree = build_tree_from_included_files(cfg.roots, included_abs, cfg.tree_max_depth)
+        else:
+            lines = ["=== Project File List ==="]
+            lines.extend(rel_display_path(d.path, cfg.roots) for d in included)
+            lines.append("=========================\n")
+            tree = "\n".join(lines)
         print(tree)
 
     print("=== Dry Run: Included Files ===")
@@ -946,6 +959,7 @@ def parse_args() -> Config:
 
     p.add_argument("--tree-max-depth", type=int, default=0)
     p.add_argument("--no-tree", action="store_true")
+    p.add_argument("--visual-tree", action="store_true", help="Output visual indented tree instead of flat list.")
 
     p.add_argument("--max-bytes", type=int, default=0)
     p.add_argument("--big-file", choices=["skip", "truncate"], default="skip")
@@ -987,6 +1001,7 @@ def parse_args() -> Config:
         exclude_paths=tuple(a.exclude_path),
         tree_max_depth=a.tree_max_depth,
         include_tree=(not a.no_tree),
+        visual_tree=a.visual_tree,
         max_bytes=a.max_bytes,
         big_file=a.big_file,
         truncate_bytes=a.truncate_bytes,
