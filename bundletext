@@ -830,6 +830,7 @@ def write_bundle(cfg: Config, decisions: Sequence[FileDecision]) -> int:
                 out_f.write(content)
                 if not content.endswith("\n"):
                     out_f.write("\n")
+                out_f.write("<<<END FILE>>>\n")
 
                 count += 1
             except Exception:
