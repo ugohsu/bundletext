@@ -110,7 +110,7 @@ DEFAULT_INSTRUCTIONS = """\
 === AI INSTRUCTIONS (Generic) ===
 You are given:
 1) Project Tree: for understanding structure.
-2) File Contents: each file begins with <<<FILE: path>>> and ends with <<<END FILE>>>.
+2) File Contents: each file begins with @@@ BUNDLE FILE: path @@@ and ends with @@@ BUNDLE END FILE @@@.
 
 Guidelines:
 - Use any high-level descriptions or comments (if present) to understand structure and intent.
@@ -829,7 +829,7 @@ def write_bundle(cfg: Config, decisions: Sequence[FileDecision]) -> int:
             read_bytes = d.read_bytes
 
             try:
-                out_f.write(f"\n<<<FILE: {disp}>>>\n")
+                out_f.write(f"\n@@@ BUNDLE FILE: {disp} @@@\n")
 
                 if read_bytes is None:
                     with open(fp, "r", encoding="utf-8", errors="replace") as f:
@@ -844,7 +844,7 @@ def write_bundle(cfg: Config, decisions: Sequence[FileDecision]) -> int:
                 out_f.write(content)
                 if not content.endswith("\n"):
                     out_f.write("\n")
-                out_f.write("<<<END FILE>>>\n")
+                out_f.write("@@@ BUNDLE END FILE @@@\n")
 
                 count += 1
             except Exception:
